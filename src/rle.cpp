@@ -42,7 +42,29 @@ namespace compressor{
 
 	std::vector<RLEbits> rleEncode(const std::vector<int>& data){
 		//time to encode
+		std::vector<RLEbits> code;
+		//create vector to store compressed data
+		//create current that tells us what the current value is
+		int current =data.front();
+		//create RLEbits object that will get pushed to vector then reset on failed condition
+		RLEbits temp;
+		//loop will iterate through data, conditions will be if current==data[i] code.count++
+		//when false, current = data[i], count gets stored
+		int count=0;
 		for( int i=0; i<data.size;i++){
+			if(current!=data[i]){
+				temp.count=count;
+				temp.value=data[i-1];
+				code.push_back(temp);
+				current=data[i];
+				count=1;
+				continue;
+			}
+			count++;
+
+			
+		}
+		
 		}
 
 	}
