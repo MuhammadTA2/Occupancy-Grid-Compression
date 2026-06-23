@@ -1,4 +1,5 @@
 #include "rle.h"
+//grid bro
 namespace compressor{
 	std::vector<Tile> splitGrid(const Grid& grid){
 		std::vector<Tile> tiles; //define the tiles object to be returned, should contain 100 10x10 matrices
@@ -38,8 +39,11 @@ namespace compressor{
 		return flat;
 	}
 
+
 	std::vector<RLEbits> rleEncode(const std::vector<int>& data){
-		//
+		//time to encode
+		for( int i=0; i<data.size;i++){
+		}
 
 	}
 
