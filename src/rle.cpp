@@ -27,12 +27,15 @@ namespace compressor{
 
 
 	
-	std::vector<int> flattenTile(const Tile& tile){
+	std::vector<int> flattenTiles(const std::vector<Tile>& tiles){
 		std::vector<int> flat;
-		for(int i=0;i<10;i++){
-			for(int j=0; j<10;j++){
-				flat.push_back(tile.data[i][j]);
+		for(const auto& tile: tiles){
+
+			for(int i=0;i<10;i++){
+				for(int j=0; j<10;j++){
+					flat.push_back(tile.data[i][j]);
 			}
+		}
 		}
 		return flat;
 	}
@@ -89,7 +92,7 @@ namespace compressor{
 		}
 		return decoded;
 	}
-	std::vector<Tile> reTile(const std::vector<int> flat){
+	std::vector<Tile> reTile(const std::vector<int>& flat){
 		//Tile the flattneted (supposedly decoded) dataset so it can be rebuilt into a grid
 		//create each tile to fill a row up to 10 collumns, and then start next row
 		//start by creating a tile vector
@@ -149,5 +152,15 @@ namespace compressor{
 
 		}
 		return updatedGrid;
+
 	}
+
+	double compressionRatio(const std::vector<int>& uncompressed, const std::vector<RLEbits>& compressed){
+    		if (compressed.empty()) return 0.0;
+
+    		double originalSize = uncompressed.size() * sizeof(int);
+    		double compressedSize = compressed.size() * sizeof(RLEbits);
+
+    		return originalSize / compressedSize;
+}
 }
