@@ -39,7 +39,17 @@ namespace compressor{
 		}
 		return flat;
 	}
+	std::vector<int> flattenGrid(const Grid& grid) {
+    		std::vector<int> flat;
 
+    		for (int i = 0; i < 100; i++) {
+       			for (int j = 0; j < 100; j++) {
+        	    	flat.push_back(grid.data[i][j]);
+        }
+    }	
+
+    		return flat;
+	}
 
 	std::vector<RLEbits> rleEncode(const std::vector<int>& data){
 		//time to encode

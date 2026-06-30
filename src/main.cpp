@@ -79,7 +79,7 @@ int main() {
 
 	std::vector<Tile> tiles= splitGrid(grid_tx);
 
-	std::vector<int> flatGrid_tx=flattenTiles(tiles);
+	std::vector<int> flatGrid_tx=flattenGrid(grid_tx);
 
 	
 
