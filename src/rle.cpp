@@ -114,10 +114,11 @@ namespace compressor{
 		if(changedTiles.empty()) return oldGrid;
 		Grid updatedGrid= oldGrid;
 		for(size_t t=0; t<changedTiles.size();t++){
-			Tile tile= changedTiles[t];
+			const Tile& tile= changedTiles[t];
+			
 			for(int r=0; r<tile.rows; r++){
 				for(int c=0; c<tile.cols; c++){
-					updatedGrid.data[(tile.rowStart+r*updatedGrid.cols)+(tile.colStart+c)]=tile.data[r*tile.cols+c];
+					updatedGrid.data[(tile.rowStart+r)*updatedGrid.cols+(tile.colStart+c)]=tile.data[r*tile.cols+c];
 				}
 			}
 
