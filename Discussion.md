@@ -1,6 +1,6 @@
 # Engineering Decisions
 
-## 2026-07-06 — Use a narrow-waist architecture
+## 07/06/2026 — Use a narrow-waist architecture
 
 ### Decision
 The pipeline will convert map-specific data into generic `SymbolStream`s before entropy coding.
@@ -25,7 +25,7 @@ Cons:
 ### Status
 Accepted
 
-## 2026-07-06 — Defer Map/Layer hierarchy
+## 07/06/2026 — Defer Map/Layer hierarchy
 
 ### Decision
 `Grid`/`Tile` remain single-layer. We are not introducing a `Map` → `Layer` → `Tile` hierarchy yet, even though the long-term vision includes multiple map layers (occupancy, height, traversability, confidence).
@@ -52,7 +52,7 @@ Promote `Grid` → `Layer`; add `Map` as shared geometry (rows/cols/resolution/o
 ### Status
 Accepted
 
-## 2026-07-06 — Split `ICompressor` into `IPreprocessor` and `IEntropyCoder`
+## 07/06/2026 — Split `ICompressor` into `IPreprocessor` and `IEntropyCoder`
 
 ### Decision
 Compression algorithms are modeled behind two interfaces instead of one: `IPreprocessor` (`SymbolStream → SymbolStream`, e.g. RLE) for structural transforms, and `IEntropyCoder` (`SymbolStream → bytes`) for statistical entropy coding (e.g. Huffman). An earlier plan modeled both as peer implementations of a single `ICompressor`.
@@ -75,3 +75,27 @@ Cons:
 
 ### Status
 Accepted
+
+## 07/06/2026 — Lessons learned: silent bugs from the Grid/RLE/Metrics module split
+
+### What happened
+Splitting the monolithic `rle.h`/`rle.cpp` into `grid.h`/`grid.cpp`, `rle.h`/`rle.cpp`, and `metrics.h`/`metrics.cpp` (Milestone 2) introduced two real bugs, neither of which produced a compiler error or warning:
+
+1. `main.cpp`'s call to `compressionRatio` passed its two `size_t` arguments in the reverse order of the function's declared parameter list (`compressed, uncompressed`), silently inverting the printed ratio.
+2. `metrics.cpp`'s implementation computed `original/compressed` as integer division (both operands were `size_t`) and only converted to `double` on return, truncating the result.
+
+Both type-check fine — two same-typed arguments happily bind in either order, and integer division silently produces a `double`-compatible value on return, just the wrong one.
+
+### Why the existing test suite didn't catch them
+`test_compressionRatio` originally used 100 identical values, which RLE-encodes to a single run and produces an exact ratio (`400 bytes / 8 bytes = 50.0`). Integer division and floating-point division agree whenever the division happens to be exact, so the truncation bug passed the test while still being live in `main.cpp`. The argument-order bug wasn't caught at all, because no test exercises `main.cpp`'s own call sites — the test suite only calls the library API directly, in whatever order each test chooses.
+
+### Why this matters going forward
+- A test's input data should be chosen to break plausible wrong implementations, not just to exercise the happy path. A ratio/metric test in particular should avoid inputs whose correct answer happens to be a round number — that's exactly where integer-truncation bugs hide.
+- Two adjacent same-typed parameters (`size_t compressed, size_t uncompressed`) are easy to pass in the wrong order at any call site, and nothing catches it automatically — not the compiler, not a same-shaped unit test.
+- Unit tests validate library functions; they don't validate how callers actually invoke them. A bug can live entirely in a call site rather than in any function that has a test.
+
+### Resulting change
+Milestone 1's test suite was revised (after the fact) to use input data whose correct compression ratio is not a whole number, specifically so this class of bug can't hide behind a convenient round number again.
+
+### Status
+Recorded
