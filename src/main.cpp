@@ -1,4 +1,7 @@
 #include "rle.h"
+#include "grid.h"
+#include "metrics.h"
+
 #include <iostream>
 #include <random>
 #include<vector>
@@ -35,7 +38,7 @@ int main() {
 
 	
 	
-	double cRatio=compressionRatio(grid_tx.data,encoded);
+	double cRatio=compressionRatio(encoded.size()*sizeof(RLEbits),grid_tx.data.size()*sizeof(int));
 
  	std::cout << "Original cells: " << grid_tx.data.size() << "\n";
     	std::cout << "Encoded RLE runs: " << encoded.size() << "\n";
