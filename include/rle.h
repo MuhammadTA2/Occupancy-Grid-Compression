@@ -1,5 +1,7 @@
 #ifndef RLE_H
 #define RLE_H
+
+#include <cstddef>
 #include <vector>
 namespace compressor{
 	struct RLEbits {
