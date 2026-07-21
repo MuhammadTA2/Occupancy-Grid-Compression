@@ -41,24 +41,24 @@ void test_createGrid() {
 }
 
 void test_rleEncodeDecode_roundTrip() {
-	std::vector<int> data = {1, 1, 1, 0, 0, 2, 2, 2, 2};
+	std::vector<uint8_t> data = {1, 1, 1, 0, 0, 2, 2, 2, 2};
 	std::vector<RLEbits> encoded = rleEncode(data);
-	std::vector<int> decoded = rleDecode(encoded);
+	std::vector<uint8_t> decoded = rleDecode(encoded);
 	checkEqual(encoded.size(), static_cast<size_t>(3), "rleEncode: run count for {1,1,1,0,0,2,2,2,2}");
 	check(decoded == data, "rleEncode/rleDecode: round trip preserves data");
 }
 
 void test_rleEncode_singleRun() {
-	std::vector<int> data = {5, 5, 5, 5};
+	std::vector<uint8_t> data = {5, 5, 5, 5};
 	std::vector<RLEbits> encoded = rleEncode(data);
 	bool ok = encoded.size() == 1 && encoded[0].value == 5 && encoded[0].count == 4;
 	check(ok, "rleEncode: single run collapses to one RLEbits{value=5,count=4}");
 }
 
 void test_rleEncodeDecode_empty() {
-	std::vector<int> empty;
+	std::vector<uint8_t> empty;
 	std::vector<RLEbits> encoded = rleEncode(empty);
-	std::vector<int> decoded = rleDecode(encoded);
+	std::vector<uint8_t> decoded = rleDecode(encoded);
 	check(encoded.empty(), "rleEncode: empty input produces empty output");
 	check(decoded.empty(), "rleDecode: empty input produces empty output");
 }
@@ -159,7 +159,7 @@ void test_updateTiles_emptyChangedTiles() {
 }
 
 void test_rebuildGrid() {
-	std::vector<int> flat = {1, 2, 3, 4, 5, 6};
+	std::vector<uint8_t> flat = {1, 2, 3, 4, 5, 6};
 	Grid grid = rebuildGrid(flat, 2, 3);
 	checkEqual(grid.rows, 2, "rebuildGrid: rows");
 	checkEqual(grid.cols, 3, "rebuildGrid: cols");
@@ -172,19 +172,19 @@ void test_compressionRatio() {
 	// fake. (An earlier version of this test used 100 identical values -> a single run -> a 400/8=50.0
 	// ratio that divides evenly, which silently passed even when compressionRatio's implementation used
 	// truncating integer division instead of floating-point division.)
-	std::vector<int> uncompressed = {1, 1, 1, 2, 2, 3, 3};
+	std::vector<uint8_t> uncompressed = {1, 1, 1, 2, 2, 3, 3};
 	std::vector<RLEbits> compressed = rleEncode(uncompressed);
-	double expected = static_cast<double>(uncompressed.size() * sizeof(int)) /
+	double expected = static_cast<double>(uncompressed.size() * sizeof(Cell)) /
 	                   static_cast<double>(compressed.size() * sizeof(RLEbits));
-	double actual = compressionRatio(compressed.size() * sizeof(RLEbits), uncompressed.size() * sizeof(int));
+	double actual = compressionRatio(compressed.size() * sizeof(RLEbits), uncompressed.size() * sizeof(Cell));
 	checkEqual(compressed.size(), static_cast<size_t>(3), "compressionRatio: setup sanity - three runs for {1,1,1,2,2,3,3}");
 	checkEqual(actual, expected, "compressionRatio: matches originalSize/compressedSize for a non-integer ratio");
 }
 
 void test_compressionRatio_emptyCompressed() {
-	std::vector<int> uncompressed = {1, 2, 3};
+	std::vector<uint8_t> uncompressed = {1, 2, 3};
 	std::vector<RLEbits> compressed;
-	checkEqual(compressionRatio(compressed.size() * sizeof(RLEbits), uncompressed.size() * sizeof(int)), 0.0,
+	checkEqual(compressionRatio(compressed.size() * sizeof(RLEbits), uncompressed.size() * sizeof(Cell)), 0.0,
 	           "compressionRatio: empty compressed input returns 0.0");
 }
 

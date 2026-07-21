@@ -29,7 +29,7 @@ int main() {
     	for (int r = 20; r < 30; r++) grid_tx.data[r * grid_tx.cols + 75] = 0;
 
 	std::vector<RLEbits> encoded= rleEncode(grid_tx.data);
-	std::vector<int> decoded= rleDecode(encoded);
+	std::vector<uint8_t> decoded= rleDecode(encoded);
 	Grid grid_rx= rebuildGrid(decoded,grid_tx.rows,grid_tx.cols);
 			
 
@@ -38,7 +38,7 @@ int main() {
 
 	
 	
-	double cRatio=compressionRatio(encoded.size()*sizeof(RLEbits),grid_tx.data.size()*sizeof(int));
+	double cRatio=compressionRatio(encoded.size()*sizeof(RLEbits),grid_tx.data.size()*sizeof(Cell));
 
  	std::cout << "Original cells: " << grid_tx.data.size() << "\n";
     	std::cout << "Encoded RLE runs: " << encoded.size() << "\n";

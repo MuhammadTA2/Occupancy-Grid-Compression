@@ -99,3 +99,34 @@ Milestone 1's test suite was revised (after the fact) to use input data whose co
 
 ### Status
 Recorded
+
+## 07/20/2026 — Milestone 2 hardening: narrower cell/run types
+
+### What happened
+`Grid`/`Tile` data was changed from `std::vector<int>` to `std::vector<Cell>` (`Cell = uint8_t`), and `RLEbits` from `{int value; int count;}` to `{uint8_t value; uint16_t count;}` (with a guard forcing a new run before `count` wraps past 65535). This cuts grid/tile memory 4x, matters for the eventual ESP32 target, and required updating `main.cpp` and `tests/test_main.cpp` call sites to match — both still declared `vector<int>` and one used `sizeof(int)` for the "original size" byte count, which would have silently overstated the compression ratio by 4x once `Cell` shrank to 1 byte.
+
+### Why
+Occupancy values only need three states (free/obstacle/uncertain); a 4-byte `int` per cell is wasted memory on a target where memory is the scarce resource. This is a pure representation change — no new interfaces, no behavior change beyond byte width.
+
+### Verification
+Rebuilt and reverified: 24/24 tests pass, demo round-trips correctly (`main.cpp`'s printed ratio changed from `8.10373` to `4.05186`, which is expected — both the original and compressed operand byte counts shrank, not a regression).
+
+### Status
+Accepted
+
+## 07/20/2026 — Packet prototype written early, not adopted as Milestone 6
+
+### What happened
+A `Packet` prototype (`include/packet.h`/`src/packet.cpp`) was written ahead of schedule: a packed `PacketHeader` + payload, an XOR checksum, and `packetizeTile`/`reassembleTile` for splitting a tile's serialized RLE stream into LoRa-radio-sized (~200 byte) chunks.
+
+### Why it isn't being adopted as-is
+It couples directly to `RLEbits` (`serializeRLE`/`deserializeRLE` hard-code RLE's wire format into the packet layer), which contradicts the narrow-waist decision recorded above — `Packet` was meant to depend only on the opaque bytes `IEntropyCoder::encode()` produces, not on a specific preprocessor's struct. It also implements LoRa-specific multi-packet chunking (`packetizeTile`/`reassembleTile`, the 255-byte SX127x payload limit), which this plan's "Explicitly deferred" list already scopes out for this pass.
+
+### Resolution
+- `include/packet.h`/`src/packet.cpp` are committed as-is, **not wired into the build** (not referenced in `src/CMakeLists.txt`), and explicitly not treated as Milestone 6 being complete.
+- Both files carry a header comment marking them as a prototype/design reference, not final.
+- Milestone 6 will rebuild `Packet` fresh against `IEntropyCoder`'s byte output once Milestones 3-5 exist. This prototype is expected to be replaced (not extended) at that point.
+- The LoRa-specific chunking (`packetizeTile`/`reassembleTile`, radio payload-size limits) is split out as its own future/deferred item, separate from core `Packet` framing.
+
+### Status
+Recorded — superseded upon Milestone 6 implementation
