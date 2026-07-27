@@ -9,6 +9,7 @@ namespace compressor{
 			EncodedStreams streams;
 			if(runs.values.size() != runs.counts.size()) return streams;
 			if(countsCoderType != CoderType::Varint && countsCoderType != CoderType::Rice) return streams;
+			if(countsCoderType == CoderType::Rice && riceParam >= 32) return streams; // rice::encode would reject this anyway -- fail here, not with a silently-broken stream
 
 			std::vector<uint8_t> valuesBytes;
 			if(!fixedwidth::encode(runs.values, valueBitWidth, valuesBytes)) return EncodedStreams{};

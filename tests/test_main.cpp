@@ -233,6 +233,76 @@ void test_countsCoder_dispatchesRice() {
 	check(ok && decoded == counts, "countscoder::decode: CoderType::Rice round trips");
 }
 
+void test_rice_encode_rejectsShiftWidthOverflow() {
+	std::vector<uint16_t> counts = {1, 2, 3};
+	// k >= 32 would make value >> k undefined behavior (shift width for a
+	// 32-bit operand) -- must be rejected, not silently produce garbage.
+	check(rice::encode(counts, 32).empty(), "rice::encode: rejects k == 32 (shift-width overflow)");
+	check(rice::encode(counts, 200).empty(), "rice::encode: rejects k == 200 (shift-width overflow)");
+	check(!rice::encode(counts, 31).empty(), "rice::encode: k == 31 (just below the boundary) still works");
+}
+
+void test_rice_decode_rejectsShiftWidthOverflow() {
+	std::vector<uint16_t> counts = {1, 2, 3};
+	std::vector<uint8_t> encoded = rice::encode(counts, 4);
+	std::vector<uint16_t> decoded;
+
+	// Same encoded bytes, but decode is asked to use an out-of-range k --
+	// this is exactly what a corrupted/adversarial riceParam byte on the
+	// wire would produce. quotient << k must never execute for k >= 32.
+	check(!rice::decode(encoded, 32, counts.size(), decoded), "rice::decode: rejects k == 32 (shift-width overflow)");
+	check(!rice::decode(encoded, 255, counts.size(), decoded), "rice::decode: rejects k == 255 (shift-width overflow)");
+}
+
+void test_rlecodec_encode_rejectsRiceShiftWidthOverflow() {
+	std::vector<uint8_t> data = {1, 1, 1, 0, 0, 2, 2, 2, 2};
+	RLERuns runs = rleEncode(data);
+	check(rlecodec::encode(runs, 2, CoderType::Rice, 32).empty(),
+	      "rlecodec::encode: rejects CoderType::Rice with riceParam == 32 rather than emitting a broken blob");
+}
+
+void test_splitcodec_encode_rejectsRiceShiftWidthOverflow() {
+	std::vector<uint8_t> data = {1, 1, 1, 0, 0, 2, 2, 2, 2};
+	RLERuns runs = rleEncode(data);
+	splitcodec::EncodedStreams streams = splitcodec::encode(runs, 2, CoderType::Rice, 32);
+	check(streams.valuesBytes.empty() && streams.countsBytes.empty(),
+	      "splitcodec::encode: rejects CoderType::Rice with riceParam == 32 rather than emitting a broken stream");
+}
+
+void test_rlecodec_decode_rejectsAdversarialRiceParam() {
+	// Hand-craft a blob exactly like the one a corrupted/adversarial packet
+	// would produce: a structurally valid header naming CoderType::Rice,
+	// but with a riceParam byte that would be UB if it reached rice::decode
+	// unchecked. encode() can no longer produce this itself (it now
+	// rejects up front -- see the test above), so this simulates data
+	// arriving over the wire some other way (bit flip, malicious sender).
+	std::vector<uint8_t> data = {1, 1, 1, 0, 0, 2, 2, 2, 2};
+	RLERuns runs = rleEncode(data);
+	std::vector<uint8_t> validBlob = rlecodec::encode(runs, 2, CoderType::Rice, 4);
+	check(!validBlob.empty(), "test setup: a legitimate Rice-coded blob with riceParam=4 encodes fine");
+
+	std::vector<uint8_t> corrupted = validBlob;
+	corrupted[1] = 200; // stomp the riceParam byte with an out-of-range value
+
+	RLERuns decodedRuns;
+	check(!rlecodec::decode(corrupted, 2, decodedRuns),
+	      "rlecodec::decode: rejects a corrupted riceParam byte (>= 32) instead of hitting UB in rice::decode");
+}
+
+void test_splitcodec_decode_rejectsAdversarialRiceParam() {
+	std::vector<uint8_t> data = {1, 1, 1, 0, 0, 2, 2, 2, 2};
+	RLERuns runs = rleEncode(data);
+	splitcodec::EncodedStreams streams = splitcodec::encode(runs, 2, CoderType::Rice, 4);
+	check(!streams.countsBytes.empty(), "test setup: a legitimate Rice-coded stream with riceParam=4 encodes fine");
+
+	std::vector<uint8_t> corruptedCounts = streams.countsBytes;
+	corruptedCounts[1] = 255; // stomp the riceParam byte with an out-of-range value
+
+	RLERuns decodedRuns;
+	check(!splitcodec::decode(streams.valuesBytes, corruptedCounts, 2, decodedRuns),
+	      "splitcodec::decode: rejects a corrupted riceParam byte (>= 32) instead of hitting UB in rice::decode");
+}
+
 void test_countsCoder_chooseBest_picksSmallerAndRoundTrips() {
 	// Many small, repetitive counts -- exactly the shape where Rice's
 	// per-value bit cost beats Varint's byte-granular floor.
@@ -968,6 +1038,12 @@ int main() {
 	test_varintCoder_decode_overflowRejected();
 	test_countsCoder_dispatchesVarint();
 	test_countsCoder_dispatchesRice();
+	test_rice_encode_rejectsShiftWidthOverflow();
+	test_rice_decode_rejectsShiftWidthOverflow();
+	test_rlecodec_encode_rejectsRiceShiftWidthOverflow();
+	test_splitcodec_encode_rejectsRiceShiftWidthOverflow();
+	test_rlecodec_decode_rejectsAdversarialRiceParam();
+	test_splitcodec_decode_rejectsAdversarialRiceParam();
 	test_countsCoder_chooseBest_picksSmallerAndRoundTrips();
 	test_rleCodec_autoSelect_embedsWinningCoderType();
 	test_rleCodec_decode_rejectsUnrecognizedCoderType();

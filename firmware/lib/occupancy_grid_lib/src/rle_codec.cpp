@@ -8,6 +8,7 @@ namespace compressor{
 		std::vector<uint8_t> encode(const RLERuns& runs, uint8_t valueBitWidth, CoderType countsCoderType, uint8_t riceParam){
 			if(runs.values.size() != runs.counts.size()) return {};
 			if(countsCoderType != CoderType::Varint && countsCoderType != CoderType::Rice) return {}; // unrecognized coder
+			if(countsCoderType == CoderType::Rice && riceParam >= 32) return {}; // rice::encode would reject this anyway -- fail here, not with a silently-broken blob
 
 			std::vector<uint8_t> packedValues;
 			if(!fixedwidth::encode(runs.values, valueBitWidth, packedValues)) return {};

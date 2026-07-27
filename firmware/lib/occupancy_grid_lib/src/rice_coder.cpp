@@ -4,8 +4,14 @@
 namespace compressor{
 	namespace rice{
 		std::vector<uint8_t> encode(const std::vector<uint16_t>& counts, uint8_t k){
+			// A shift by >= the operand's bit width (32 for uint32_t) is
+			// undefined behavior in C++, not just "wrong" -- reject before
+			// value >> k below can ever hit that, rather than relying on
+			// callers never passing a bad k.
+			if(k >= 32) return {};
+
 			BitWriter writer;
-			uint32_t mask = (k >= 32) ? 0xFFFFFFFFu : ((1u << k) - 1u);
+			uint32_t mask = (1u << k) - 1u;
 			for(uint16_t v : counts){
 				uint32_t value = static_cast<uint32_t>(v);
 				uint32_t quotient = value >> k;
@@ -18,6 +24,12 @@ namespace compressor{
 		}
 
 		bool decode(const std::vector<uint8_t>& data, uint8_t k, size_t count, std::vector<uint16_t>& out){
+			// k arrives from wire data (rlecodec/splitcodec's riceParam byte)
+			// completely unvalidated -- reject k >= 32 here rather than let
+			// quotient << k below hit undefined behavior on a corrupted or
+			// adversarial packet.
+			if(k >= 32) return false;
+
 			BitReader reader(data);
 			std::vector<uint16_t> result;
 			result.reserve(count);
