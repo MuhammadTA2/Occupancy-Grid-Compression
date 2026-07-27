@@ -20,11 +20,9 @@ constexpr int LORA_PIN_NSS  = 5;
 constexpr int LORA_PIN_RST  = 14;
 constexpr int LORA_PIN_DIO0 = 2;
 
-// SX1276-family radios are tunable across roughly 862-1020 MHz regardless of
-// which "band" (868/900/915) the module is nominally sold as -- what matters
-// is that BOTH boards use the exact same value here, and that the value is
-// legal to transmit on on your hardware/region. Adjust if needed; this is
-// the one setting that must match on both the sender and receiver builds.
-constexpr long LORA_FREQUENCY_HZ = 915E6;
+// Must match the modules' actual operating frequency, and must be identical
+// on both the sender and receiver builds -- a mismatch here means the two
+// radios simply won't hear each other, with no error reported by either side.
+constexpr long LORA_FREQUENCY_HZ = 900E6;
 
 #endif

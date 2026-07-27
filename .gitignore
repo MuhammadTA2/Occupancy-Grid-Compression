@@ -1,4 +1,7 @@
 build/
+build-debug/
 *.exe
 *.swp
 *.swo
+firmware/.venv/
+firmware/.pio/
