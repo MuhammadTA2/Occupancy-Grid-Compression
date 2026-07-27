@@ -40,8 +40,8 @@ namespace compressor{
 		for(size_t t=0;t<tiles.size();t++){
 			const Tile& tile=tiles[t];
 
-			for(int i=0; i<tile.rows;i++){
-				for(int j=0; j<tile.cols; j++){
+			for(size_t i=0; i<tile.rows;i++){
+				for(size_t j=0; j<tile.cols; j++){
 					grid.data[(tile.rowStart+i)*grid.cols+(tile.colStart+j)]=tile.data[i*tile.cols+j];
 				}
 			}
@@ -74,5 +74,25 @@ namespace compressor{
 		}
 		return updatedGrid;
 
+	}
+	//symbol stream implementation
+	SymbolStream toSymbolStream(const Grid& grid){
+		SymbolStream stream;
+		stream.format = StreamFormat::Raw;
+		stream.symbols.reserve(grid.data.size());
+		for(Cell c : grid.data){
+			stream.symbols.push_back(static_cast<uint8_t>(c));
+		}
+		return stream;
+	}
+	Grid fromSymbolStream(const SymbolStream& symbolstream, int rows, int cols){
+		Grid grid;
+		grid.rows=rows;
+		grid.cols=cols;
+		grid.data.reserve(symbolstream.symbols.size());
+		for(uint8_t b : symbolstream.symbols){
+			grid.data.push_back(static_cast<Cell>(b));
+		}
+		return grid;
 	}
 }

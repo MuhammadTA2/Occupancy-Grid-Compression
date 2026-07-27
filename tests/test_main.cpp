@@ -41,8 +41,8 @@ void test_createGrid() {
 }
 
 void test_rleEncodeDecode_roundTrip() {
-	std::vector<uint8_t> data = {1, 1, 1, 0, 0, 2, 2, 2, 2};
-	std::vector<RLEbits> encoded = rleEncode(data);
+	SymbolStream data = {1, 1, 1, 0, 0, 2, 2, 2, 2};
+	std::vector<RLEbits> encoded = rleEncode(data.symbol);
 	std::vector<uint8_t> decoded = rleDecode(encoded);
 	checkEqual(encoded.size(), static_cast<size_t>(3), "rleEncode: run count for {1,1,1,0,0,2,2,2,2}");
 	check(decoded == data, "rleEncode/rleDecode: round trip preserves data");

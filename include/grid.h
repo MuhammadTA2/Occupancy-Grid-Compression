@@ -2,6 +2,7 @@
 #define GRID_H
 #include <vector>
 #include <cstdint>
+#include "symbol_stream.h"
 namespace compressor{
 	const int tileSize=10;
 
@@ -26,6 +27,10 @@ namespace compressor{
 	Grid createGrid(int rows, int cols);
 	std::vector<Tile> splitGrid(const Grid& grid);
 	Grid updateTiles(Grid grid, const std::vector<Tile>& changedTiles);
+	
+	SymbolStream toSymbolStream(const Grid& grid);
+
+	Grid fromSymbolStream(const SymbolStream& symbolstream, int rows, int cols);
 
 	Grid rebuildTiledGrid(const std::vector<Tile>& tiles, int rows, int cols);
 	Grid rebuildGrid(const std::vector<Cell>& flat, int rows, int cols);
