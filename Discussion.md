@@ -200,3 +200,66 @@ That utility (see 07/21/2026 discussion, was slated for the old Milestone 6) was
 
 ### Status
 Accepted (Varint replaces Huffman as the active milestone; Huffman itself is deferred, not deleted, and `EntropyCoderType::Huffman` stays in the enum as a marked future extension).
+
+## 07/27/2026 — Milestone 4 implemented as SoA + 2-bit packed values; corrects the 07/22/2026 entry
+
+### Decision
+Milestone 4 shipped with a different wire shape than the 07/22/2026 entry above describes. RLE's structural output is `RLERuns { values, counts }` (Structure-of-Arrays — all values, then all counts), not interleaved `[value][count]` records. Values are bit-packed via a new `FixedWidthCoder` (2 bits/value for occupancy, built on new `BitWriter`/`BitReader` classes), not left as plain 1-byte fields. Counts are LEB128-encoded via a new `VarintCoder`, itself a thin wrapper over `compressor::varint`. A new `rlecodec` module (`include/rle_codec.h`) combines both into one self-contained blob: `[run count N: varint][values: N * bitWidth bits, packed][counts: N LEB128 varints]`.
+
+### Why
+Interleaving values and counts per-run would force either padding every varint to a byte boundary before it (wasting bits) or a bit-cursor-aware varint decoder (breaking its byte-oriented independence). SoA keeps `BitWriter`/`FixedWidthCoder` and `VarintCoder` each in their own natural, fully independent mode.
+
+### Corrections to 07/22/2026
+Two claims from that entry do not hold under this design:
+- **"No separate record-count/length header is needed"** — false once values are bit-packed. A bit-packed values section is no longer self-delimiting by EOF the way the old byte-per-run scheme was, so `rlecodec::encode` prepends an explicit leading run count `N` (itself a varint). That header also fixes the values section's byte length deterministically (`ceil(N * bitWidth / 8)`), so no delimiter is needed between the values and counts sections either.
+- **"`BitWriter`/`BitReader` move to deferred alongside Huffman"** — reversed. They were built now (`include/bit_writer.h`, `src/bit_writer.cpp`) and are load-bearing for `FixedWidthCoder`'s 2-bit value packing, not deferred.
+
+Also worth noting for anyone reading the two entries together: `RLEbits` (the old `{value, count}` struct) no longer exists; `rle.h`/`rle.cpp` were rewritten around `RLERuns`. And the enum that shipped is `CoderType` (`FixedWidth`, `Varint`, `Unknown`), not `EntropyCoderType` — currently a thin descriptive tag with no dispatch scaffolding (there's exactly one coder per role so far), meant to become load-bearing once packet metadata exists (Milestone 7).
+
+### Status
+Accepted, implemented, and verified — build and full test suite pass, including a full-pipeline round trip on empty, single-run, and worst-case-checkerboard grids.
+
+## 07/27/2026 — Milestone 5: Rice/Golomb benchmark, and CoderType becomes real dispatch (not a label)
+
+### Decision
+Built `compressor::rice` (`include/rice_coder.h`) — Golomb-Rice coding for run counts, parameterized by `k` — and a benchmark (`src/benchmark.cpp`) comparing it against `VarintCoder` across synthetic datasets (uniform, sparse obstacles, random noise, worst-case checkerboard). Result: Rice beats Varint on every non-trivial dataset (20-60% smaller counts sections), because LEB128 has a hard floor of 8 bits per count while Rice can go well below that once `k` is tuned to the data.
+
+Rather than picking one of Varint/Rice as a new fixed default, `CoderType` was turned into an actual dispatch mechanism: a new `compressor::countscoder` module (`include/counts_coder.h`) switches on `CoderType` to call the matching coder's encode/decode, plus a `chooseBest()` that tries all known counts coders (Varint, and a k-search over Rice) and returns whichever is smallest for that specific payload. `rlecodec`'s blob format gained a 2-byte header (`[CoderType][riceParam]`) ahead of the run-count `N`, so the blob is self-describing — `rlecodec::decode` no longer needs to be told which counts coder was used; it reads that back out of the blob itself. `rlecodec::encode` auto-selects via `chooseBest` by default, with an explicit-choice overload for callers that want to force a specific coder.
+
+### Why
+This corrects a real design mistake made in the previous entry (07/27/2026, Milestone 4): `CoderType` was built as "a thin descriptive tag with no dispatch scaffolding," on the reasoning that there was only one coder per role so far. That missed the actual point of splitting `IPreprocessor`/`IEntropyCoder` into separate roles in the first place (07/06/2026 entry) — the split exists precisely so multiple interchangeable entropy coders can be written once (Rice, Golomb, Huffman, Varint, ...) and selected per use case through `SymbolStream`'s narrow waist, not so one gets crowned "the" default and the others sit unused. Once there were two real counts coders (Varint, Rice), building the actual switch-based dispatch was the correct move, not optional polish.
+
+### Status
+Accepted, implemented, and verified — build and full test suite pass (including new tests for `countscoder`'s dispatch, `chooseBest`, and `rlecodec`'s embedded-CoderType round trip and malformed-CoderType rejection). Corrects this document's own 07/27/2026 Milestone 4 entry, which is now stale on the "CoderType is a thin tag" point.
+
+## 07/27/2026 — Milestones 7-10: Packetizer, ITransport/LoopbackTransport, PacketReassembler, and splitcodec
+
+### Decision
+Built the packetizer (`include/packetizer.h`, new -- the earlier `packet.h`/`packet.cpp` prototype stays untouched as a historical reference per the 07/20/2026 entry below, not extended): fixed 9-byte header (version, messageId, streamId, fragmentIndex, totalFragments, payloadLength), CRC-16-CCITT over header+payload, `MAX_PACKET_SIZE`/`HEADER_SIZE`/`CRC_SIZE`/`MAX_PAYLOAD_SIZE` as named constants. `streamId` is opaque -- the packetizer has zero knowledge of what "values" or "counts" mean.
+
+Built `ITransport` (`include/transport.h`) as an actual virtual interface with `LoopbackTransport` (in-memory FIFO queue) implementing it. This is deliberately not tag-dispatch: transport swapping happens per-packet, not per-symbol, so vtable overhead is negligible here, unlike the compression layer where it was rejected specifically to avoid ESP32 vtable cost.
+
+Built `PacketReassembler` (`include/packet_reassembler.h`), keyed by `(messageId, streamId)`, tracking received fragments in a `map<fragmentIndex, payload>` so `tryGetCompleteStream()` reassembles strictly by fragment index regardless of arrival order. Rejects a fragment whose `totalFragments` disagrees with earlier fragments of the same key, or whose `fragmentIndex >= totalFragments`; accepts genuine duplicates idempotently. `missingFragments()` exposes what Milestone 11's ARQ needs.
+
+Introduced a new module, `splitcodec` (`include/split_codec.h`), to actually realize "the values stream and counts stream fragment independently" (07/06/2026 / Milestone 7 roadmap intent): `rlecodec` (Milestone 4/5) produces one combined self-contained blob, which is the wrong shape to hand to the packetizer under two separate `streamId`s. `splitcodec::encode` instead returns two byte sequences: `valuesBytes` (raw `FixedWidthCoder` output, no header -- its length is deterministic once `N` and `valueBitWidth` are known) and `countsBytes` (self-describing: `[CoderType][riceParam][N: varint][counts]`). `N` deliberately lives only in `countsBytes`, not duplicated in both streams -- decode reads `countsBytes` first to learn `N`, which also gives it `valuesBytes`' expected deterministic length, so a length mismatch between the two streams is detectable as corruption rather than silently misdecoded.
+
+Wired the full pipeline together in `src/main.cpp`: `Grid -> toSymbolStream -> rleEncode -> splitcodec::encode -> packetizer::fragment` (independently per stream) `-> LoopbackTransport -> PacketReassembler -> splitcodec::decode -> rleDecode -> fromSymbolStream -> Grid`. This is the first true end-to-end demonstration of the documented pipeline, not each piece tested in isolation.
+
+### Why
+`rlecodec`'s single-blob design was the right call when it was built (Milestone 4/5, before a packetizer existed) but doesn't compose with Milestone 7's fault-containment goal: fragmenting one combined blob under a single `streamId` means a single corrupted fragment can straddle the values/counts boundary and take down both, exactly what independent fragmentation was meant to prevent. `rlecodec` itself wasn't changed -- it remains a valid convenience API for callers that want one blob and don't need independent fragmentation (e.g. the Milestone 4/5 tests and demo block still use it as-is).
+
+### Status
+Accepted, implemented, and verified — build and full test suite pass, including packetizer fragmentation/serialization/CRC/malformed-input tests, `LoopbackTransport` FIFO tests, `PacketReassembler` out-of-order/duplicate/inconsistent-header/missing-fragment tests, `splitcodec` round-trip and disagreeing-stream-length tests, and the full loopback pipeline demo in `main.cpp`.
+
+## 07/27/2026 — Milestone 11: ARQ over a lossy transport, plus a real bug caught by its own test
+
+### Decision
+Built `LossyTransport` (`include/lossy_transport.h`) -- a test double that drops packets at a configurable probability (fixed-seed RNG for reproducible tests). `send()` always returns `true`: a real sender has no synchronous way to learn a transmission was lost, so this doesn't fake one either. Built batched per-message ARQ (`include/arq.h`): `sendWithRetry()` fragments and sends a stream once, drains whatever arrived into the `PacketReassembler`, then repeats "resend exactly what `missingFragments()` still reports" for up to `maxRetries` additional rounds before giving up.
+
+### Bug found and fixed
+The first implementation broke under 100% packet loss: `sendWithRetry` would call `missingFragments()`, see an empty list, and `break` out of the retry loop after just 1 round instead of exhausting all `maxRetries` -- looking like a graceful give-up, but for the wrong reason. Root cause: `PacketReassembler::missingFragments()` can only report indices for a `(messageId, streamId)` it has learned `totalFragments` for, which only happens once at least one fragment has actually arrived. Under total loss, the reassembler never learns anything about the stream at all, so "missing" was empty not because nothing was missing, but because the reassembler didn't know the stream existed yet -- and the code mistook the former for the latter.
+
+Fix: when `missingFragments()` comes back empty but the stream also isn't complete, `sendWithRetry` now falls back to its own authoritative fragment list (`allPackets`, built locally from the original `packetizer::fragment()` call) and resends everything, rather than trusting the reassembler's view when that view is empty by omission rather than by completion. Caught by `test_arq_sendWithRetry_givesUpAfterMaxRetries` (a `LossyTransport(1.0)` test) expecting `roundsUsed == 4` (1 initial send + 3 retries) and getting `1` instead -- exactly the kind of one-shot-not-N-round give-up this fix corrects.
+
+### Status
+Accepted, implemented, and verified — full test suite passes, including the bug-catching test above, a partial-loss recovery test (`LossyTransport(0.3)`, confirms eventual success and byte-exact reassembled data), and a `main.cpp` demo block showing the same grid pipeline recovering over a 30%-drop-rate transport.
