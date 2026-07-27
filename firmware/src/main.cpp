@@ -12,43 +12,91 @@
 
 using namespace compressor;
 
+// Bidirectional protocol over one LoRa link, distinguished by messageId:
+//   GRID_MESSAGE_ID          (rover -> base)  : occupancy grid, via splitcodec (values+counts streams)
+//   INSTRUCTIONS_MESSAGE_ID  (base -> rover)  : movement waypoints, raw bytes (no RLE -- a handful of
+//                                               waypoints has nothing for run-length to exploit)
+//
+// Serial legs (real, not synthetic):
+//   Jetson -> ROVER   : a flat vector of GRID_ROWS*GRID_COLS cell bytes (0/1/2), no header. Both ends
+//                       must already agree on GRID_ROWS/GRID_COLS since this framing has no length
+//                       field -- if the Jetson ever needs to send a *variable* size, this needs a
+//                       [rows][cols] header added, matching the BASE->computer leg below.
+//   BASE -> computer  : [rows:2][cols:2][cell bytes...], all little-endian.
+//   computer -> BASE  : [waypointCount:1][x:2][y:2] repeated -- same (x,y) encoding as the LoRa leg,
+//                       with a count prefix added since a raw serial stream needs an explicit boundary
+//                       that the LoRa leg gets for free from the reassembled buffer's own length.
+//   ROVER -> Jetson   : same [waypointCount:1][x:2][y:2] framing, forwarding what arrived over LoRa.
+//                       Placeholder framing -- not yet confirmed against real Jetson-side code.
+//
+// Real path planning and real motor control are still separate, not-yet-built pieces on the
+// computer and powertrain-ESP32 sides respectively; this firmware only owns the two ESP32s and the
+// LoRa link between them.
 namespace{
-	const uint16_t MESSAGE_ID = 1;
+	const uint16_t GRID_MESSAGE_ID = 1;
+	const uint16_t INSTRUCTIONS_MESSAGE_ID = 2;
 	const uint8_t VALUES_STREAM_ID = 0;
 	const uint8_t COUNTS_STREAM_ID = 1;
+	const uint8_t INSTRUCTIONS_STREAM_ID = 0;
 	const uint8_t VALUE_BIT_WIDTH = 2; // occupancy values are 0/1/2, 11 reserved
+
+	// Fixed grid size shared by both ends of the Jetson<->ROVER serial link
+	// (see header comment -- that framing has no length field of its own).
+	const int GRID_ROWS = 20;
+	const int GRID_COLS = 20;
 
 	LoRaTransport transport;
 	PacketReassembler reassembler;
-	bool decodedAlready = false;
 
-	// Small synthetic occupancy grid -- kept modest on purpose. LoRa's
-	// airtime per packet (tens to hundreds of ms depending on spreading
-	// factor) makes a 100x100 grid like the host demo impractical for a
-	// first real-hardware smoke test; 20x20 is enough to exercise multiple
-	// fragments on both streams without a multi-second transmission.
-	Grid buildTestGrid(){
-		Grid grid = createGrid(20, 20);
-		for(int i = 0; i < grid.cols; i++){
-			grid.data[0 * grid.cols + i] = 1;
-			grid.data[(grid.rows - 1) * grid.cols + i] = 1;
+	struct Waypoint{ int16_t x; int16_t y; };
+
+	// No compression here on purpose -- unlike an occupancy grid, a short
+	// waypoint list has no long runs for RLE to exploit, so this is just a
+	// flat little-endian encoding.
+	std::vector<uint8_t> encodeWaypoints(const std::vector<Waypoint>& waypoints){
+		std::vector<uint8_t> bytes;
+		bytes.reserve(waypoints.size() * 4);
+		for(const Waypoint& w : waypoints){
+			bytes.push_back(static_cast<uint8_t>(w.x & 0xFF));
+			bytes.push_back(static_cast<uint8_t>((w.x >> 8) & 0xFF));
+			bytes.push_back(static_cast<uint8_t>(w.y & 0xFF));
+			bytes.push_back(static_cast<uint8_t>((w.y >> 8) & 0xFF));
 		}
-		for(int r = 0; r < grid.rows; r++){
-			grid.data[r * grid.cols + 0] = 1;
-			grid.data[r * grid.cols + (grid.cols - 1)] = 1;
-		}
-		for(int r = 3; r < 17; r++){
-			grid.data[r * grid.cols + 10] = 1;
-		}
-		for(int r = 8; r < 12; r++){
-			grid.data[r * grid.cols + 10] = 0; // a gap in the wall
-		}
-		return grid;
+		return bytes;
 	}
 
-	void sendStream(const std::vector<uint8_t>& data, uint8_t streamId, const char* label){
-		std::vector<packetizer::Packet> packets = packetizer::fragment(MESSAGE_ID, streamId, data);
-		Serial.printf("Sending %s stream: %u bytes -> %u fragment(s)\n", label,
+	std::vector<Waypoint> decodeWaypoints(const std::vector<uint8_t>& bytes){
+		std::vector<Waypoint> waypoints;
+		for(size_t i = 0; i + 4 <= bytes.size(); i += 4){
+			int16_t x = static_cast<int16_t>(bytes[i] | (bytes[i + 1] << 8));
+			int16_t y = static_cast<int16_t>(bytes[i + 2] | (bytes[i + 3] << 8));
+			waypoints.push_back(Waypoint{x, y});
+		}
+		return waypoints;
+	}
+
+	void initLoRa(){
+		Serial.begin(115200);
+		delay(1000); // give the serial monitor time to attach
+
+		// Serial2 (separate UART, separate pins -- see pins.h) carries only
+		// the binary Jetson/computer protocol; Serial (USB) carries only
+		// human-readable debug text. Keeping them apart means the
+		// Jetson/computer side never has to distinguish debug output from
+		// real payload bytes on the wire.
+		Serial2.begin(DATA_UART_BAUD, SERIAL_8N1, DATA_UART_RX_PIN, DATA_UART_TX_PIN);
+
+		LoRa.setPins(LORA_PIN_NSS, LORA_PIN_RST, LORA_PIN_DIO0);
+		if(!LoRa.begin(LORA_FREQUENCY_HZ)){
+			Serial.println("LoRa.begin() failed -- check wiring and LORA_FREQUENCY_HZ (pins.h).");
+			while(true) delay(1000);
+		}
+		Serial.println("LoRa radio initialized.");
+	}
+
+	void sendStream(uint16_t messageId, const std::vector<uint8_t>& data, uint8_t streamId, const char* label){
+		std::vector<packetizer::Packet> packets = packetizer::fragment(messageId, streamId, data);
+		Serial.printf("Sending %s: %u bytes -> %u fragment(s)\n", label,
 		              static_cast<unsigned>(data.size()), static_cast<unsigned>(packets.size()));
 
 		for(const packetizer::Packet& p : packets){
@@ -62,8 +110,43 @@ namespace{
 		}
 	}
 
-	void runSenderOnce(){
-		Grid grid = buildTestGrid();
+	// Blocks (yielding via delay(), not busy-spinning) until exactly `count`
+	// bytes have arrived on Serial2 -- the dedicated binary data link, not
+	// the USB debug console.
+	std::vector<uint8_t> readExactDataBytes(size_t count){
+		std::vector<uint8_t> buf;
+		buf.reserve(count);
+		while(buf.size() < count){
+			if(Serial2.available()){
+				buf.push_back(static_cast<uint8_t>(Serial2.read()));
+			} else {
+				delay(1);
+			}
+		}
+		return buf;
+	}
+}
+
+#if defined(DEVICE_ROLE_ROVER)
+
+namespace{
+	bool sentGrid = false;
+	bool gotInstructions = false;
+}
+
+void setup(){
+	initLoRa();
+	Serial.println("Role: ROVER");
+}
+
+void loop(){
+	if(!sentGrid){
+		Serial.printf("Waiting for a %dx%d grid (%d bytes) from the Jetson over Serial2...\n",
+		              GRID_ROWS, GRID_COLS, GRID_ROWS * GRID_COLS);
+		std::vector<uint8_t> cellBytes = readExactDataBytes(static_cast<size_t>(GRID_ROWS) * GRID_COLS);
+		Serial.println("Grid received from Jetson.");
+
+		Grid grid = rebuildGrid(cellBytes, GRID_ROWS, GRID_COLS);
 		SymbolStream stream = toSymbolStream(grid);
 		RLERuns runs = rleEncode(stream.symbols);
 		splitcodec::EncodedStreams streams = splitcodec::encode(runs, VALUE_BIT_WIDTH);
@@ -71,83 +154,129 @@ namespace{
 		Serial.printf("Grid: %dx%d, %u cells, %u RLE runs\n", grid.rows, grid.cols,
 		              static_cast<unsigned>(grid.data.size()), static_cast<unsigned>(runs.values.size()));
 
-		sendStream(streams.valuesBytes, VALUES_STREAM_ID, "values");
-		sendStream(streams.countsBytes, COUNTS_STREAM_ID, "counts");
-
-		Serial.println("Done sending. (No ARQ in this first firmware pass -- see main.cpp comment.)");
+		sendStream(GRID_MESSAGE_ID, streams.valuesBytes, VALUES_STREAM_ID, "grid values");
+		sendStream(GRID_MESSAGE_ID, streams.countsBytes, COUNTS_STREAM_ID, "grid counts");
+		Serial.println("Grid sent. Waiting for instructions from base...");
+		sentGrid = true;
+		return;
 	}
 
-	void runReceiverStep(){
-		std::vector<uint8_t> raw;
-		if(!transport.receive(raw)) return;
+	if(gotInstructions) return; // done for this first pass -- no re-scan loop yet
 
-		packetizer::Packet packet;
-		if(!packetizer::deserialize(raw, packet)){
-			Serial.println("Received a corrupted/malformed packet -- dropped.");
-			return;
-		}
+	std::vector<uint8_t> raw;
+	if(!transport.receive(raw)) return;
 
-		reassembler.receive(packet);
-		Serial.printf("Got messageId=%u streamId=%u fragment %u/%u (%u byte payload), RSSI=%d\n",
-		              packet.header.messageId, packet.header.streamId,
-		              static_cast<unsigned>(packet.header.fragmentIndex + 1),
-		              static_cast<unsigned>(packet.header.totalFragments),
-		              static_cast<unsigned>(packet.payload.size()), LoRa.packetRssi());
-
-		if(decodedAlready) return;
-		bool valuesComplete = reassembler.isComplete(MESSAGE_ID, VALUES_STREAM_ID);
-		bool countsComplete = reassembler.isComplete(MESSAGE_ID, COUNTS_STREAM_ID);
-		if(!valuesComplete || !countsComplete) return;
-
-		std::vector<uint8_t> valuesBytes, countsBytes;
-		reassembler.tryGetCompleteStream(MESSAGE_ID, VALUES_STREAM_ID, valuesBytes);
-		reassembler.tryGetCompleteStream(MESSAGE_ID, COUNTS_STREAM_ID, countsBytes);
-
-		RLERuns runs;
-		bool decodeOk = splitcodec::decode(valuesBytes, countsBytes, VALUE_BIT_WIDTH, runs);
-		if(!decodeOk){
-			Serial.println("splitcodec::decode failed -- both streams complete but data didn't decode.");
-			decodedAlready = true;
-			return;
-		}
-
-		std::vector<uint8_t> symbols = rleDecode(runs);
-		SymbolStream stream;
-		stream.format = StreamFormat::Raw;
-		stream.symbols = symbols;
-		Grid rebuilt = fromSymbolStream(stream, 20, 20);
-
-		Serial.printf("Decode succeeded: %u cells reconstructed, %u RLE runs\n",
-		              static_cast<unsigned>(rebuilt.data.size()), static_cast<unsigned>(runs.values.size()));
-		decodedAlready = true;
+	packetizer::Packet packet;
+	if(!packetizer::deserialize(raw, packet)){
+		Serial.println("Received a corrupted/malformed packet -- dropped.");
+		return;
 	}
+	if(packet.header.messageId != INSTRUCTIONS_MESSAGE_ID) return; // not instructions traffic
+
+	reassembler.receive(packet);
+	Serial.printf("Got instructions fragment %u/%u, RSSI=%d\n",
+	              static_cast<unsigned>(packet.header.fragmentIndex + 1),
+	              static_cast<unsigned>(packet.header.totalFragments), LoRa.packetRssi());
+
+	if(!reassembler.isComplete(INSTRUCTIONS_MESSAGE_ID, INSTRUCTIONS_STREAM_ID)) return;
+
+	std::vector<uint8_t> instructionsBytes;
+	reassembler.tryGetCompleteStream(INSTRUCTIONS_MESSAGE_ID, INSTRUCTIONS_STREAM_ID, instructionsBytes);
+	std::vector<Waypoint> waypoints = decodeWaypoints(instructionsBytes);
+
+	Serial.printf("Instructions received: %u waypoint(s)\n", static_cast<unsigned>(waypoints.size()));
+	for(const Waypoint& w : waypoints){
+		Serial.printf("  (%d, %d)\n", w.x, w.y);
+	}
+
+	// Forward to the Jetson over Serial2: [count:1][x:2][y:2] repeated.
+	// Placeholder framing -- adjust if your Jetson-side code expects
+	// something different; this wasn't specified yet.
+	Serial2.write(static_cast<uint8_t>(waypoints.size()));
+	std::vector<uint8_t> waypointBytes = encodeWaypoints(waypoints);
+	Serial2.write(waypointBytes.data(), waypointBytes.size());
+
+	gotInstructions = true;
+}
+
+#elif defined(DEVICE_ROLE_BASE)
+
+namespace{
+	bool gotGrid = false;
+	bool sentInstructions = false;
 }
 
 void setup(){
-	Serial.begin(115200);
-	delay(1000); // give the serial monitor time to attach
-
-	LoRa.setPins(LORA_PIN_NSS, LORA_PIN_RST, LORA_PIN_DIO0);
-	if(!LoRa.begin(LORA_FREQUENCY_HZ)){
-		Serial.println("LoRa.begin() failed -- check wiring and LORA_FREQUENCY_HZ (pins.h).");
-		while(true) delay(1000);
-	}
-	Serial.println("LoRa radio initialized.");
-
-#if defined(DEVICE_ROLE_SENDER)
-	Serial.println("Role: SENDER");
-	runSenderOnce();
-#elif defined(DEVICE_ROLE_RECEIVER)
-	Serial.println("Role: RECEIVER -- waiting for packets...");
-#else
-	#error "Build with -D DEVICE_ROLE_SENDER or -D DEVICE_ROLE_RECEIVER (see platformio.ini environments)"
-#endif
+	initLoRa();
+	Serial.println("Role: BASE -- waiting for grid...");
 }
 
 void loop(){
-#if defined(DEVICE_ROLE_RECEIVER)
-	runReceiverStep();
-#else
-	delay(1000); // sender has nothing left to do after setup()'s one-shot send
-#endif
+	if(sentInstructions) return; // done for this first pass
+
+	std::vector<uint8_t> raw;
+	if(!transport.receive(raw)) return;
+
+	packetizer::Packet packet;
+	if(!packetizer::deserialize(raw, packet)){
+		Serial.println("Received a corrupted/malformed packet -- dropped.");
+		return;
+	}
+	if(packet.header.messageId != GRID_MESSAGE_ID) return; // not grid traffic
+
+	reassembler.receive(packet);
+	Serial.printf("Got grid fragment: streamId=%u %u/%u, RSSI=%d\n",
+	              packet.header.streamId,
+	              static_cast<unsigned>(packet.header.fragmentIndex + 1),
+	              static_cast<unsigned>(packet.header.totalFragments), LoRa.packetRssi());
+
+	if(gotGrid) return;
+	bool valuesComplete = reassembler.isComplete(GRID_MESSAGE_ID, VALUES_STREAM_ID);
+	bool countsComplete = reassembler.isComplete(GRID_MESSAGE_ID, COUNTS_STREAM_ID);
+	if(!valuesComplete || !countsComplete) return;
+
+	std::vector<uint8_t> valuesBytes, countsBytes;
+	reassembler.tryGetCompleteStream(GRID_MESSAGE_ID, VALUES_STREAM_ID, valuesBytes);
+	reassembler.tryGetCompleteStream(GRID_MESSAGE_ID, COUNTS_STREAM_ID, countsBytes);
+
+	RLERuns runs;
+	bool decodeOk = splitcodec::decode(valuesBytes, countsBytes, VALUE_BIT_WIDTH, runs);
+	if(!decodeOk){
+		Serial.println("splitcodec::decode failed -- both streams complete but data didn't decode.");
+		gotGrid = true;
+		return;
+	}
+
+	std::vector<uint8_t> symbols = rleDecode(runs);
+	Serial.printf("Grid decoded: %u cells, %u RLE runs\n",
+	              static_cast<unsigned>(symbols.size()), static_cast<unsigned>(runs.values.size()));
+	gotGrid = true;
+
+	// Forward the decompressed grid to the base-station computer over
+	// Serial2: [rows:2][cols:2][cell bytes...], little-endian. No trailing
+	// terminator -- the computer-side reader must read exactly
+	// 4 + rows*cols bytes and stop there.
+	Serial2.write(static_cast<uint8_t>(GRID_ROWS & 0xFF));
+	Serial2.write(static_cast<uint8_t>((GRID_ROWS >> 8) & 0xFF));
+	Serial2.write(static_cast<uint8_t>(GRID_COLS & 0xFF));
+	Serial2.write(static_cast<uint8_t>((GRID_COLS >> 8) & 0xFF));
+	Serial2.write(symbols.data(), symbols.size());
+	Serial.println("Grid forwarded to base-station computer over Serial2. Waiting for path instructions...");
+
+	// Block until the base-station computer sends back:
+	// [waypointCount:1][x:2][y:2] repeated.
+	std::vector<uint8_t> countByte = readExactDataBytes(1);
+	uint8_t waypointCount = countByte[0];
+	std::vector<uint8_t> waypointBytes = readExactDataBytes(static_cast<size_t>(waypointCount) * 4);
+	std::vector<Waypoint> path = decodeWaypoints(waypointBytes);
+	Serial.printf("Received %u waypoint(s) from the base-station computer.\n", static_cast<unsigned>(path.size()));
+
+	std::vector<uint8_t> instructionsBytes = encodeWaypoints(path);
+	Serial.println("Sending instructions back to rover...");
+	sendStream(INSTRUCTIONS_MESSAGE_ID, instructionsBytes, INSTRUCTIONS_STREAM_ID, "instructions");
+	sentInstructions = true;
 }
+
+#else
+	#error "Build with -D DEVICE_ROLE_ROVER or -D DEVICE_ROLE_BASE (see platformio.ini environments)"
+#endif
