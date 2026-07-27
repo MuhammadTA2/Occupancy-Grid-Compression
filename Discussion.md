@@ -263,3 +263,22 @@ Fix: when `missingFragments()` comes back empty but the stream also isn't comple
 
 ### Status
 Accepted, implemented, and verified — full test suite passes, including the bug-catching test above, a partial-loss recovery test (`LossyTransport(0.3)`, confirms eventual success and byte-exact reassembled data), and a `main.cpp` demo block showing the same grid pipeline recovering over a 30%-drop-rate transport.
+
+## 07/27/2026 — Firmware: ARQ over the real rover<->base LoRa link
+
+### Decision
+`firmware/src/main.cpp`'s `arq::sendWithRetry` (host-side, single-process) doesn't translate directly to two physically separate radios -- "tell the sender what's missing" has to be an actual message sent back over the air, not something introspected locally. Added a third LoRa message type, `FRAGMENT_STATUS_MESSAGE_ID` (base -> rover), and a real two-way protocol:
+
+- Base tracks a quiet period (`QUIET_PERIOD_MS` = 500ms of no new grid fragments arriving) and, once elapsed with the grid still incomplete, sends a status report naming which fragment indices it's still missing, per stream.
+- Each stream's status is one of three states, not a plain missing-count: `STATUS_COMPLETE`, `STATUS_PARTIAL` (with indices), `STATUS_NOTHING_RECEIVED`. Collapsing the last two into "0 missing" would be ambiguous -- `PacketReassembler::missingFragments()` can't list indices for a stream it never learned `totalFragments` for (zero fragments arrived), so the rover would misread that as "confirmed complete."
+- Rover retains its fragmented packet lists after the initial send (previously local variables, discarded once `loop()` moved on) so it can resend specific indices later, up to `MAX_RETRY_ROUNDS` = 5 rounds per stream. If no status report arrives at all within `REPORT_TIMEOUT_MS` = 2000ms, the rover assumes the report itself was lost and falls back to resending everything for that stream.
+- Base sends one final `STATUS_COMPLETE`/`STATUS_COMPLETE` report the moment both streams finish, so the rover gets an unambiguous "done" signal instead of just eventually stopping retries.
+
+### Why
+Timeout/retry defaults (500ms quiet period, 5 retries, 2s report timeout) were picked as a reasonable starting point pending real airtime/loss measurements on the actual radios, not derived from hardware data -- expect to retune once real hardware testing happens.
+
+### Verification
+Firmware compiles clean for both `rover` and `base` PlatformIO environments. The protocol *logic* (not just that it compiles) was verified separately: ported the same algorithm into a host-side simulation under a transport that drops packets at a configurable rate, run across seeds at 0/20/40/60/80% loss. Realistic loss rates (0-40%) succeeded 100% of the time (60/60 runs, byte-exact decoded data); at unrealistically severe loss (60-80%) some runs failed, but every failure was a clean give-up after exhausting retries -- never a hang, never a false-positive success with corrupted data. Not yet verified against real hardware.
+
+### Status
+Accepted and implemented. Real-hardware verification (actual airtime, actual loss patterns, whether the timeout defaults hold up) is still outstanding.
