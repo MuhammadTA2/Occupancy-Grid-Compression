@@ -60,56 +60,40 @@ using namespace compressor;
 // every retry (and the ack for whichever one landed) is lost, not just the first attempt.
 //
 // Serial legs (real, not synthetic):
-//   Jetson -> ROVER   (Serial2, GPIO16/17): [rows:2][cols:2][cell bytes...], all little-endian --
-//                       same framing as the BASE->computer leg below. Rover rejects a header
-//                       describing 0 cells or more than MAX_GRID_CELLS (almost certainly a
-//                       corrupted/desynced read, not a real grid) and waits for a fresh one rather
-//                       than blocking on an unbounded read.
-//   BASE -> computer  (Serial/USB): [rows:2][cols:2][cell bytes...], all little-endian. rows/cols
-//                       here are whatever the rover actually sent for this round (see grid messages
-//                       above), not a fixed constant -- the grid size can vary round to round.
-//   computer -> BASE  (Serial/USB): [waypointCount:1][x:2][y:2] repeated -- same (x,y) encoding as
-//                       the LoRa leg, with a count prefix added since a raw serial stream needs an
-//                       explicit boundary that the LoRa leg gets for free from the reassembled
-//                       buffer's own length.
-//   ROVER -> Jetson   (Serial2, GPIO16/17): same [waypointCount:1][x:2][y:2] framing, forwarding
-//                       what arrived over LoRa. waypointCount == 0 specifically means "base never
-//                       confirmed this round" (either the grid ARQ gave up, or the instructions leg
-//                       timed out), not "zero waypoints computed". Placeholder framing -- not yet
-//                       confirmed against real Jetson-side code.
+//   Jetson -> ROVER   : [rows:2][cols:2][cell bytes...], all little-endian -- same framing as the
+//                       BASE->computer leg below. Rover rejects a header describing 0 cells or more
+//                       than MAX_GRID_CELLS (almost certainly a corrupted/desynced read, not a real
+//                       grid) and waits for a fresh one rather than blocking on an unbounded read.
+//   BASE -> computer  : [rows:2][cols:2][cell bytes...], all little-endian. rows/cols here are
+//                       whatever the rover actually sent for this round (see grid messages above),
+//                       not a fixed constant -- the grid size can vary round to round.
+//   computer -> BASE  : [waypointCount:1][x:2][y:2] repeated -- same (x,y) encoding as the LoRa leg,
+//                       with a count prefix added since a raw serial stream needs an explicit boundary
+//                       that the LoRa leg gets for free from the reassembled buffer's own length.
+//   ROVER -> Jetson   : same [waypointCount:1][x:2][y:2] framing, forwarding what arrived over LoRa.
+//                       waypointCount == 0 specifically means "base never confirmed this round" (either
+//                       the grid ARQ gave up, or the instructions leg timed out), not "zero waypoints
+//                       computed". Placeholder framing -- not yet confirmed against real Jetson-side code.
 //
 // Real path planning and real motor control are still separate, not-yet-built pieces on the
 // computer and powertrain-ESP32 sides respectively; this firmware only owns the two ESP32s and the
 // LoRa link between them.
 //
-// ROVER's Jetson leg runs on Serial2 (GPIO16/17, see pins.h) now that a real
-// UART is wired to Jetson -- Serial (USB) is free there, so `-D
-// ENABLE_SERIAL_DEBUG` gives real debug visibility on ROVER during hardware
-// testing without corrupting the data leg. BASE still has no external
-// USB-to-serial adapter wired up -- its computer leg runs on Serial (USB)
-// same as before, so debug prints stay compiled out by default on BASE
-// (mixing them with the framed binary protocol would make the PC-side
-// reader misparse debug text as payload bytes). Build BASE with `-D
-// ENABLE_SERIAL_DEBUG` only for standalone LoRa-only testing where nothing
-// is reading Serial as a data channel.
+// This bench-test build has no external USB-to-serial adapter wired to
+// Serial2/GPIO16-17 -- both ESP32s reach the PC only through their own
+// programming-port USB (`Serial`). So the binary Jetson/computer protocol
+// (the "Serial legs" above) travels over Serial instead of Serial2, and
+// human-readable debug prints are compiled out by default (mixing them with
+// framed binary data would make the PC-side reader misparse debug text as
+// payload bytes). Build with `-D ENABLE_SERIAL_DEBUG` to get prints back for
+// standalone LoRa-only testing where nothing is reading Serial as a data
+// channel.
 #if defined(ENABLE_SERIAL_DEBUG)
 	#define DBG_PRINTLN(x) Serial.println(x)
 	#define DBG_PRINTF(...) Serial.printf(__VA_ARGS__)
 #else
 	#define DBG_PRINTLN(x)
 	#define DBG_PRINTF(...)
-#endif
-
-// The Jetson/computer binary data leg. ROVER now has a real UART wired to
-// Jetson (GPIO16/17, see pins.h) instead of sharing the USB programming port,
-// so its data leg moves to Serial2 -- freeing Serial for real debug prints
-// during hardware testing. BASE's computer leg is untouched for now (still
-// USB, talking to the PC test script/base-station computer) since only the
-// Jetson side is getting wired up this round.
-#if defined(DEVICE_ROLE_ROVER)
-	HardwareSerial& DataSerial = Serial2;
-#else
-	HardwareSerial& DataSerial = Serial;
 #endif
 
 namespace{
@@ -275,10 +259,6 @@ namespace{
 		Serial.begin(115200);
 		delay(1000); // give the PC-side script/monitor time to attach after the USB-open auto-reset
 
-#if defined(DEVICE_ROLE_ROVER)
-		Serial2.begin(DATA_UART_BAUD, SERIAL_8N1, DATA_UART_RX_PIN, DATA_UART_TX_PIN);
-#endif
-
 		LoRa.setPins(LORA_PIN_NSS, LORA_PIN_RST, LORA_PIN_DIO0);
 		if(!LoRa.begin(LORA_FREQUENCY_HZ)){
 			DBG_PRINTLN("LoRa.begin() failed -- check wiring and LORA_FREQUENCY_HZ (pins.h).");
@@ -328,14 +308,14 @@ namespace{
 	}
 
 	// Blocks (yielding via delay(), not busy-spinning) until exactly `count`
-	// bytes have arrived on DataSerial -- Serial2 for ROVER (real Jetson
-	// UART), Serial for BASE (still the PC test/base-station computer link).
+	// bytes have arrived on Serial -- the native-USB link doubling as the
+	// binary data channel in this bench-test build (see header comment).
 	std::vector<uint8_t> readExactDataBytes(size_t count){
 		std::vector<uint8_t> buf;
 		buf.reserve(count);
 		while(buf.size() < count){
-			if(DataSerial.available()){
-				buf.push_back(static_cast<uint8_t>(DataSerial.read()));
+			if(Serial.available()){
+				buf.push_back(static_cast<uint8_t>(Serial.read()));
 			} else {
 				delay(1);
 			}
@@ -452,12 +432,12 @@ void loop(){
 						DBG_PRINTF("  (%d, %d)\n", w.x, w.y);
 					}
 
-					// Forward to Jetson over DataSerial: [count:1][x:2][y:2] repeated.
+					// Forward to the PC over Serial: [count:1][x:2][y:2] repeated.
 					// Placeholder framing -- adjust if your real Jetson-side code
 					// expects something different; this wasn't specified yet.
-					DataSerial.write(static_cast<uint8_t>(waypoints.size()));
+					Serial.write(static_cast<uint8_t>(waypoints.size()));
 					std::vector<uint8_t> waypointBytes = encodeWaypoints(waypoints);
-					DataSerial.write(waypointBytes.data(), waypointBytes.size());
+					Serial.write(waypointBytes.data(), waypointBytes.size());
 
 					// Ack so base can stop retrying this round's instructions. If
 					// the ack itself is lost, base will resend the whole message;
@@ -580,7 +560,7 @@ void loop(){
 	// an unbounded extra allowance to also wait on instructions afterwards.
 	if(millis() - instructionsWaitStartMillis > INSTRUCTIONS_TIMEOUT_MS){
 		DBG_PRINTLN("No instructions from base in time -- giving up on this round.");
-		DataSerial.write(static_cast<uint8_t>(0)); // tell Jetson: no waypoints this round
+		Serial.write(static_cast<uint8_t>(0)); // tell the PC: no waypoints this round
 		gotInstructions = true; // picked up by the round-complete branch above, next loop() call
 	}
 }
