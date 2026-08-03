@@ -264,6 +264,12 @@ namespace{
 			DBG_PRINTLN("LoRa.begin() failed -- check wiring and LORA_FREQUENCY_HZ (pins.h).");
 			while(true) delay(1000);
 		}
+		// Without this, radio-level noise near the sensitivity floor can be
+		// misreported by the SX127x as a genuinely "received" packet -- the
+		// packetizer's own CRC-16 (packetizer::deserialize) catches most of
+		// that downstream, but there's no reason to skip the radio's own
+		// hardware CRC check when it's this cheap to enable.
+		LoRa.enableCrc();
 		DBG_PRINTLN("LoRa radio initialized.");
 	}
 

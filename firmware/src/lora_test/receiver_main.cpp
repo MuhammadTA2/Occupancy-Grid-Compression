@@ -20,6 +20,8 @@ void setup() {
         Serial.println("LoRa.begin() FAILED -- check wiring (see pins.h) and antenna.");
         while (true) delay(1000);
     }
+    LoRa.enableCrc(); // without this, radio-level noise near the sensitivity
+                       // floor can be misreported as a "received" packet
     Serial.println("LoRa.begin() OK. Waiting for packets...");
 }
 
