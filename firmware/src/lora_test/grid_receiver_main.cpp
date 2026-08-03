@@ -8,6 +8,8 @@
 #include "packetizer.h"
 #include "packet_reassembler.h"
 #include "lora_transport.h"
+#include "coder_type.h"
+#include "metrics.h"
 
 using namespace compressor;
 
@@ -30,6 +32,15 @@ namespace{
     LoRaTransport transport;
     PacketReassembler reassembler;
     bool done = false;
+
+    const char* coderTypeName(uint8_t raw){
+        switch(static_cast<CoderType>(raw)){
+            case CoderType::FixedWidth: return "FixedWidth";
+            case CoderType::Varint:     return "Varint";
+            case CoderType::Rice:       return "Rice";
+            default:                    return "Unknown";
+        }
+    }
 
     void printGrid(const std::vector<uint8_t>& symbols, int rows, int cols){
         for(int r = 0; r < rows; r++){
@@ -118,6 +129,20 @@ void loop(){
 
     Serial.printf("RESULT: OK -- decoded %u cells, %u RLE runs.\n",
                    static_cast<unsigned>(symbols.size()), static_cast<unsigned>(runs.values.size()));
+
+    // Same stat, computed independently from what was actually received and
+    // decoded here -- compare this line against the sender's "Compression:"
+    // line. Matching values/counts sizes and ratio is a content-level
+    // corruption check on top of the CRC checks already happening at the
+    // radio and packetizer layers (see grid_sender_main.cpp's comment).
+    size_t originalBytes = symbols.size();
+    size_t compressedBytes = valuesBytes.size() + countsBytes.size();
+    double ratio = compressionRatio(compressedBytes, originalBytes);
+    Serial.printf("Compression: original=%u bytes, compressed=%u bytes (values=%u, counts=%u), ratio=%.3f:1, counts coder=%s\n",
+                   static_cast<unsigned>(originalBytes), static_cast<unsigned>(compressedBytes),
+                   static_cast<unsigned>(valuesBytes.size()), static_cast<unsigned>(countsBytes.size()),
+                   ratio, coderTypeName(countsBytes.empty() ? 255 : countsBytes[0]));
+
     Serial.println("Decoded grid (0=free, 1=obstacle, 2=uncertain):");
     printGrid(symbols, rows, cols);
     Serial.println("=== Done. Reset both boards to run again. ===");

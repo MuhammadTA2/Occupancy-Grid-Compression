@@ -7,6 +7,8 @@
 #include "split_codec.h"
 #include "packetizer.h"
 #include "lora_transport.h"
+#include "coder_type.h"
+#include "metrics.h"
 
 using namespace compressor;
 
@@ -31,6 +33,15 @@ namespace{
     const int GRID_COLS = 20;
 
     LoRaTransport transport;
+
+    const char* coderTypeName(uint8_t raw){
+        switch(static_cast<CoderType>(raw)){
+            case CoderType::FixedWidth: return "FixedWidth";
+            case CoderType::Varint:     return "Varint";
+            case CoderType::Rice:       return "Rice";
+            default:                    return "Unknown";
+        }
+    }
 
     // Same bordered-square-with-a-gapped-wall pattern as
     // test_scripts/simulate_jetson.py's build_test_grid() -- deterministic
@@ -88,6 +99,21 @@ void setup(){
     splitcodec::EncodedStreams streams = splitcodec::encode(runs, VALUE_BIT_WIDTH);
     Serial.printf("Grid: %dx%d, %u cells, %u RLE runs\n", grid.rows, grid.cols,
                    static_cast<unsigned>(grid.data.size()), static_cast<unsigned>(runs.values.size()));
+
+    // Compression stats -- printed here and (independently, from what it
+    // actually decoded) on the receiver. If the two sides' numbers match,
+    // that's a content-level corruption check on top of the CRC checks
+    // already happening at the radio and packetizer layers: a decode that
+    // silently produced different data would very likely also produce a
+    // different RLE run structure, and therefore a different compressed
+    // size/ratio here.
+    size_t originalBytes = grid.data.size();
+    size_t compressedBytes = streams.valuesBytes.size() + streams.countsBytes.size();
+    double ratio = compressionRatio(compressedBytes, originalBytes);
+    Serial.printf("Compression: original=%u bytes, compressed=%u bytes (values=%u, counts=%u), ratio=%.3f:1, counts coder=%s\n",
+                   static_cast<unsigned>(originalBytes), static_cast<unsigned>(compressedBytes),
+                   static_cast<unsigned>(streams.valuesBytes.size()), static_cast<unsigned>(streams.countsBytes.size()),
+                   ratio, coderTypeName(streams.countsBytes.empty() ? 255 : streams.countsBytes[0]));
 
     // [rows:2][cols:2] prefix on the values stream -- same framing main.cpp
     // uses, so the receiver knows the grid's shape.
