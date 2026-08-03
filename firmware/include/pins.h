@@ -25,12 +25,16 @@ constexpr int LORA_PIN_DIO0 = 2;
 // radios simply won't hear each other, with no error reported by either side.
 constexpr long LORA_FREQUENCY_HZ = 900E6;
 
-// Second hardware UART, dedicated to the binary Jetson/computer data link
-// (grid bytes in on ROVER, grid+waypoint bytes out/in on BASE). Kept
-// separate from the USB `Serial` connection, which carries only
-// human-readable debug text -- mixing both on one line would make binary
-// payloads unparseable on the Jetson/computer side (debug text interleaved
-// with raw bytes, no way to tell them apart).
+// Second hardware UART, intended for a dedicated binary Jetson/computer data
+// link (grid bytes in on ROVER, grid+waypoint bytes out/in on BASE) wired to
+// an external USB-to-serial adapter, kept separate from the USB `Serial`
+// connection so debug text and binary payloads never share one wire.
+//
+// NOT currently used by main.cpp: this bench-test setup has both ESP32s
+// reaching the PC only through their own programming-port USB, so the data
+// protocol runs over `Serial` instead (with debug prints compiled out --
+// see ENABLE_SERIAL_DEBUG in main.cpp). These constants are kept for when a
+// real external adapter (or the real Jetson) is wired up here again.
 //
 //   Jetson/computer pin -> ESP32 GPIO
 //   RX (their TX)        -> GPIO 17 (DATA_UART_TX_PIN, ESP32's TX)
