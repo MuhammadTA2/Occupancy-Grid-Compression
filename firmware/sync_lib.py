@@ -17,11 +17,10 @@ CANONICAL_INCLUDE = os.path.join(REPO_ROOT, "include")
 CANONICAL_SRC = os.path.join(REPO_ROOT, "src")
 MIRROR_DIR = os.path.join(FIRMWARE_DIR, "lib", "occupancy_grid_lib")
 
-# Host-only files that don't belong in the firmware library: packet.h/.cpp is
-# a deprecated, unused prototype superseded by packetizer.h (see
-# Discussion.md); main.cpp/benchmark.cpp/CMakeLists.txt are the host
-# demo/benchmark/build entry points, not library code.
-EXCLUDED = {"packet.h", "packet.cpp", "main.cpp", "benchmark.cpp", "CMakeLists.txt"}
+# Host-only files that don't belong in the firmware library: main.cpp/
+# benchmark.cpp/CMakeLists.txt are the host demo/benchmark/build entry
+# points, not library code.
+EXCLUDED = {"main.cpp", "benchmark.cpp", "CMakeLists.txt"}
 
 
 def sync_dir(src_dir, dst_dir):
