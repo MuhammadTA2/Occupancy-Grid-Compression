@@ -25,6 +25,18 @@ constexpr int LORA_PIN_DIO0 = 2;
 // radios simply won't hear each other, with no error reported by either side.
 constexpr long LORA_FREQUENCY_HZ = 900E6;
 
+// Radio tuning shared by both ends of a link -- centralized here (rather
+// than duplicated as literals in each sketch) specifically so the sender and
+// receiver can't drift out of sync with each other. Spreading factor in
+// particular MUST match on both sides or they simply won't hear each other,
+// same failure mode as a frequency mismatch above.
+//   LORA_TX_POWER_DBM: max is +20 (SX127x PA_BOOST); library default is +17.
+//   LORA_SPREADING_FACTOR: 6-12, library default is 7 (fastest, least
+//     sensitive). Raising it trades airtime (slower) for real receiver
+//     sensitivity margin -- useful for range testing.
+constexpr int LORA_TX_POWER_DBM = 20;
+constexpr int LORA_SPREADING_FACTOR = 7;
+
 // Second hardware UART, intended for a dedicated binary Jetson/computer data
 // link (grid bytes in on ROVER, grid+waypoint bytes out/in on BASE) wired to
 // an external USB-to-serial adapter, kept separate from the USB `Serial`

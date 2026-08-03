@@ -64,7 +64,8 @@ void setup(){
         while(true) delay(1000);
     }
     LoRa.enableCrc();
-    Serial.println("LoRa.begin() OK. Waiting for the grid test message...");
+    LoRa.setSpreadingFactor(LORA_SPREADING_FACTOR); // must match the sender's value in pins.h
+    Serial.printf("LoRa.begin() OK. SF=%d. Waiting for the grid test message...\n", LORA_SPREADING_FACTOR);
 }
 
 void loop(){

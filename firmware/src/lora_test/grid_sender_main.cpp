@@ -91,7 +91,9 @@ void setup(){
         while(true) delay(1000);
     }
     LoRa.enableCrc(); // reject radio-level noise falsely detected as a packet
-    Serial.println("LoRa.begin() OK.");
+    LoRa.setTxPower(LORA_TX_POWER_DBM);
+    LoRa.setSpreadingFactor(LORA_SPREADING_FACTOR);
+    Serial.printf("LoRa.begin() OK. TX power=%d dBm, SF=%d\n", LORA_TX_POWER_DBM, LORA_SPREADING_FACTOR);
 
     Grid grid = buildTestGrid();
     SymbolStream stream = toSymbolStream(grid);
