@@ -15,11 +15,17 @@ using namespace compressor;
 // Bidirectional protocol over one LoRa link, distinguished by messageId, run
 // in a continuous loop of rounds (one round = one grid down, one
 // instructions set back) until the device is reset or power-cycled:
-//   grid messages          (rover -> base)  : occupancy grid, via splitcodec (values+counts streams).
-//                                              messageId = GRID_MESSAGE_ID_BASE + roundNumber. The
-//                                              grid's [rows:2][cols:2] rides as a 4-byte prefix on the
-//                                              values stream's payload (not a separate tracked stream)
-//                                              so it gets the same fragmentation/ARQ guarantees for free.
+//   grid messages          (rover -> base)  : occupancy grid, via splitcodec (values+counts streams),
+//                                              plus the rover's own grid-cell position (position
+//                                              stream) so base can place the local scan on its master
+//                                              map. messageId = GRID_MESSAGE_ID_BASE + roundNumber.
+//                                              The grid's [rows:2][cols:2] rides as a 4-byte prefix on
+//                                              the values stream's payload (not a separate tracked
+//                                              stream) so it gets the same fragmentation/ARQ
+//                                              guarantees for free. It's redundant with the fixed
+//                                              GRID_ROWS/GRID_COLS below, and deliberately so: it's
+//                                              the only end-to-end check that what base decoded has
+//                                              the shape rover actually sent.
 //   FRAGMENT_STATUS_MESSAGE_ID  (base -> rover)  : which grid fragments base is still missing, so rover
 //                                                  can resend exactly those instead of everything (ARQ).
 //                                                  Always sent with this fixed messageId (it's a type
@@ -36,7 +42,7 @@ using namespace compressor;
 // just sit unused in the reassembler's map, which is fine for a bounded test session.
 //
 // ARQ over the grid link: base tracks a "quiet period" (QUIET_PERIOD_MS of no new grid fragments
-// arriving) and, once elapsed without both streams complete, sends a status report naming which
+// arriving) and, once elapsed without all three streams complete, sends a status report naming which
 // fragment indices are still missing per stream. Each stream's status is one of three states, not a
 // plain missing-count, because "0 missing" is ambiguous between "confirmed complete" and "nothing
 // received yet" (the reassembler can't report indices for a stream it doesn't know totalFragments
@@ -59,14 +65,17 @@ using namespace compressor;
 // the PC and moving on to the next round rather than blocking forever -- that's the backstop for when
 // every retry (and the ack for whichever one landed) is lost, not just the first attempt.
 //
-// Serial legs (real, not synthetic):
-//   Jetson -> ROVER   : [rows:2][cols:2][cell bytes...], all little-endian -- same framing as the
-//                       BASE->computer leg below. Rover rejects a header describing 0 cells or more
-//                       than MAX_GRID_CELLS (almost certainly a corrupted/desynced read, not a real
-//                       grid) and waits for a fresh one rather than blocking on an unbounded read.
-//   BASE -> computer  : [rows:2][cols:2][cell bytes...], all little-endian. rows/cols here are
-//                       whatever the rover actually sent for this round (see grid messages above),
-//                       not a fixed constant -- the grid size can vary round to round.
+// Serial legs (real, not synthetic). Both USB legs are fixed-size and header-less: there is no
+// length field and no framing byte anywhere on them, so both ends must already agree on
+// GRID_ROWS/GRID_COLS, and a single dropped byte desyncs the leg permanently. That shape is set by
+// the real producers/consumers, not chosen here -- the Jetson's writeGridAndPose() (src/esp_comm.cpp)
+// and the base station's main_base.py/map_dis.py (LOCAL_SIZE) both assume exactly this:
+//   Jetson -> ROVER   : [cell bytes...][x:2][y:2], little-endian, no header. Exactly
+//                       GRID_ROWS*GRID_COLS cells, then the rover's grid-cell position.
+//   BASE -> computer  : [cell bytes...][x:2][y:2], little-endian, no header -- same fixed-size shape
+//                       as the Jetson->ROVER leg. Base drops the round rather than writing anything
+//                       if what it decoded isn't exactly GRID_ROWS x GRID_COLS, so a shape mismatch
+//                       fails visibly instead of silently shifting every later round on this leg.
 //   computer -> BASE  : [waypointCount:1][x:2][y:2] repeated -- same (x,y) encoding as the LoRa leg,
 //                       with a count prefix added since a raw serial stream needs an explicit boundary
 //                       that the LoRa leg gets for free from the reassembled buffer's own length.
@@ -103,21 +112,25 @@ namespace{
 	const uint16_t INSTRUCTIONS_ACK_MESSAGE_ID = 4;
 	const uint8_t VALUES_STREAM_ID = 0;
 	const uint8_t COUNTS_STREAM_ID = 1;
+	const uint8_t POSITION_STREAM_ID = 2;
 	const uint8_t INSTRUCTIONS_STREAM_ID = 0;
 	const uint8_t STATUS_STREAM_ID = 0;
 	const uint8_t INSTRUCTIONS_ACK_STREAM_ID = 0;
 	const uint8_t VALUE_BIT_WIDTH = 2; // occupancy values are 0/1/2, 11 reserved
+	const size_t POSITION_BYTES = 4; // [x:2][y:2], little-endian int16
+
+	// Fixed grid size shared by both ends of both USB legs -- see the header
+	// comment: that framing carries no length field, so this constant is the
+	// only thing making it parseable. Changing it here means changing it in
+	// mapping.cpp, base/main_base.py (via map_dis.LOCAL_SIZE) and both
+	// test_scripts/ simulators too; there is no shared source of truth yet.
+	const int GRID_ROWS = 70;
+	const int GRID_COLS = 70;
 
 	uint16_t gridMessageIdForRound(uint16_t round){ return static_cast<uint16_t>(GRID_MESSAGE_ID_BASE + round); }
 	uint16_t instructionsMessageIdForRound(uint16_t round){ return static_cast<uint16_t>(INSTRUCTIONS_MESSAGE_ID_BASE + round); }
 	bool isGridMessageId(uint16_t id){ return id >= GRID_MESSAGE_ID_BASE && id < INSTRUCTIONS_MESSAGE_ID_BASE; }
 	uint16_t roundOfGridMessageId(uint16_t id){ return static_cast<uint16_t>(id - GRID_MESSAGE_ID_BASE); }
-
-	// Sanity cap on rows*cols from a grid header (Serial or the values-stream
-	// prefix) -- guards against a corrupted/desynced header being read as a
-	// huge size and blocking forever on bytes that will never arrive. Well
-	// above any grid size actually expected here; tune if that changes.
-	const size_t MAX_GRID_CELLS = 40000;
 
 	// ARQ tuning (see header comment for the overall design).
 	const unsigned long QUIET_PERIOD_MS = 500;
@@ -181,13 +194,15 @@ namespace{
 		return waypoints;
 	}
 
-	// Fragment-status report, covering both grid streams in one message:
+	// Fragment-status report, covering all three grid streams in one message:
 	//   [subjectMessageId:2]
-	//   [valuesStatus:1] (+ [count:1][idx:2]*count only if valuesStatus == STATUS_PARTIAL)
-	//   [countsStatus:1] (+ [count:1][idx:2]*count only if countsStatus == STATUS_PARTIAL)
+	//   [valuesStatus:1]   (+ [count:1][idx:2]*count only if valuesStatus == STATUS_PARTIAL)
+	//   [countsStatus:1]   (+ [count:1][idx:2]*count only if countsStatus == STATUS_PARTIAL)
+	//   [positionStatus:1] (+ [count:1][idx:2]*count only if positionStatus == STATUS_PARTIAL)
 	std::vector<uint8_t> encodeStatusReport(uint16_t subjectMessageId,
 	                                         uint8_t valuesStatus, const std::vector<uint16_t>& valuesMissing,
-	                                         uint8_t countsStatus, const std::vector<uint16_t>& countsMissing){
+	                                         uint8_t countsStatus, const std::vector<uint16_t>& countsMissing,
+	                                         uint8_t positionStatus, const std::vector<uint16_t>& positionMissing){
 		std::vector<uint8_t> bytes;
 		bytes.push_back(static_cast<uint8_t>(subjectMessageId & 0xFF));
 		bytes.push_back(static_cast<uint8_t>((subjectMessageId >> 8) & 0xFF));
@@ -209,6 +224,15 @@ namespace{
 				bytes.push_back(static_cast<uint8_t>((idx >> 8) & 0xFF));
 			}
 		}
+
+		bytes.push_back(positionStatus);
+		if(positionStatus == STATUS_PARTIAL){
+			bytes.push_back(static_cast<uint8_t>(positionMissing.size()));
+			for(uint16_t idx : positionMissing){
+				bytes.push_back(static_cast<uint8_t>(idx & 0xFF));
+				bytes.push_back(static_cast<uint8_t>((idx >> 8) & 0xFF));
+			}
+		}
 		return bytes;
 	}
 
@@ -219,6 +243,8 @@ namespace{
 		std::vector<uint16_t> valuesMissing;
 		uint8_t countsStatus = STATUS_NOTHING_RECEIVED;
 		std::vector<uint16_t> countsMissing;
+		uint8_t positionStatus = STATUS_NOTHING_RECEIVED;
+		std::vector<uint16_t> positionMissing;
 	};
 
 	bool readMissingList(const std::vector<uint8_t>& bytes, size_t& pos, std::vector<uint16_t>& out){
@@ -235,7 +261,7 @@ namespace{
 
 	StatusReport decodeStatusReport(const std::vector<uint8_t>& bytes){
 		StatusReport report;
-		if(bytes.size() < 4) return report; // truncated -- not even the two status bytes fit
+		if(bytes.size() < 5) return report; // truncated -- not even the three status bytes fit
 		size_t pos = 0;
 		report.subjectMessageId = static_cast<uint16_t>(bytes[0]) | static_cast<uint16_t>(static_cast<uint16_t>(bytes[1]) << 8);
 		pos = 2;
@@ -249,6 +275,12 @@ namespace{
 		report.countsStatus = bytes[pos++];
 		if(report.countsStatus == STATUS_PARTIAL){
 			if(!readMissingList(bytes, pos, report.countsMissing)) return report;
+		}
+
+		if(pos >= bytes.size()) return report;
+		report.positionStatus = bytes[pos++];
+		if(report.positionStatus == STATUS_PARTIAL){
+			if(!readMissingList(bytes, pos, report.positionMissing)) return report;
 		}
 
 		report.valid = true;
@@ -329,7 +361,7 @@ namespace{
 namespace{
 	uint16_t roundNumber = 0;
 	bool sentGrid = false;
-	bool gridConfirmed = false; // both streams confirmed complete or given up on
+	bool gridConfirmed = false; // all three streams confirmed complete or given up on
 	bool gotInstructions = false;
 
 	uint16_t currentGridMsgId = 0;
@@ -338,10 +370,13 @@ namespace{
 
 	std::vector<packetizer::Packet> gridValuesPackets;
 	std::vector<packetizer::Packet> gridCountsPackets;
+	std::vector<packetizer::Packet> gridPositionPackets;
 	bool valuesDone = false;
 	bool countsDone = false;
+	bool positionDone = false;
 	int valuesRetryRound = 0;
 	int countsRetryRound = 0;
+	int positionRetryRound = 0;
 	unsigned long lastArqActivityMillis = 0;
 }
 
@@ -395,6 +430,17 @@ void loop(){
 					} else if(!countsDone){
 						DBG_PRINTLN("Giving up on counts stream after max retries.");
 						countsDone = true;
+					}
+
+					if(report.positionStatus == STATUS_COMPLETE){
+						positionDone = true;
+					} else if(!positionDone && positionRetryRound < MAX_RETRY_ROUNDS){
+						positionRetryRound++;
+						if(report.positionStatus == STATUS_PARTIAL) resendFragments(gridPositionPackets, report.positionMissing, "position");
+						else resendAllFragments(gridPositionPackets, "position"); // STATUS_NOTHING_RECEIVED
+					} else if(!positionDone){
+						DBG_PRINTLN("Giving up on position stream after max retries.");
+						positionDone = true;
 					}
 				}
 			} else if(packet.header.messageId == currentInstructionsMsgId){
@@ -454,6 +500,7 @@ void loop(){
 					gridConfirmed = true;
 					valuesDone = true;
 					countsDone = true;
+					positionDone = true;
 				}
 			}
 			// anything else (e.g. a stale report/instructions fragment from an
@@ -466,24 +513,18 @@ void loop(){
 		currentGridMsgId = gridMessageIdForRound(roundNumber);
 		currentInstructionsMsgId = instructionsMessageIdForRound(roundNumber);
 
-		DBG_PRINTF("Round %u: waiting for a grid header from the PC over Serial...\n", static_cast<unsigned>(roundNumber));
-		int gridRows = 0, gridCols = 0;
-		while(true){
-			std::vector<uint8_t> header = readExactDataBytes(4);
-			int r = static_cast<int>(header[0]) | (static_cast<int>(header[1]) << 8);
-			int c = static_cast<int>(header[2]) | (static_cast<int>(header[3]) << 8);
-			if(r > 0 && c > 0 && static_cast<size_t>(r) * static_cast<size_t>(c) <= MAX_GRID_CELLS){
-				gridRows = r;
-				gridCols = c;
-				break;
-			}
-			DBG_PRINTF("Rejected grid header %dx%d (invalid, or exceeds the %u-cell cap) -- waiting for a new header.\n",
-			           r, c, static_cast<unsigned>(MAX_GRID_CELLS));
-		}
-
-		DBG_PRINTF("Grid is %dx%d (%d cells) -- reading cell bytes from the PC...\n", gridRows, gridCols, gridRows * gridCols);
+		// Fixed-size, header-less read -- see the header comment. There's no
+		// length field to validate, so there's nothing to reject here either:
+		// if this leg has desynced, it desynced silently and stays that way.
+		const int gridRows = GRID_ROWS;
+		const int gridCols = GRID_COLS;
+		DBG_PRINTF("Round %u: reading %dx%d cells + position from the PC over Serial...\n",
+		           static_cast<unsigned>(roundNumber), gridRows, gridCols);
 		std::vector<uint8_t> cellBytes = readExactDataBytes(static_cast<size_t>(gridRows) * gridCols);
-		DBG_PRINTLN("Grid received from PC.");
+		std::vector<uint8_t> positionBytes = readExactDataBytes(POSITION_BYTES);
+		DBG_PRINTF("Grid + position received from PC (position %d, %d).\n",
+		           static_cast<int>(static_cast<int16_t>(positionBytes[0] | (positionBytes[1] << 8))),
+		           static_cast<int>(static_cast<int16_t>(positionBytes[2] | (positionBytes[3] << 8))));
 
 		Grid grid = rebuildGrid(cellBytes, gridRows, gridCols);
 		SymbolStream stream = toSymbolStream(grid);
@@ -508,7 +549,8 @@ void loop(){
 
 		gridValuesPackets = sendStream(currentGridMsgId, valuesPayload, VALUES_STREAM_ID, "grid values");
 		gridCountsPackets = sendStream(currentGridMsgId, streams.countsBytes, COUNTS_STREAM_ID, "grid counts");
-		DBG_PRINTLN("Grid sent. Waiting for fragment-status reports from base...");
+		gridPositionPackets = sendStream(currentGridMsgId, positionBytes, POSITION_STREAM_ID, "position");
+		DBG_PRINTLN("Grid + position sent. Waiting for fragment-status reports from base...");
 		sentGrid = true;
 		lastArqActivityMillis = millis();
 		// Counted from grid-send, not from grid confirmation -- instructions can
@@ -527,15 +569,18 @@ void loop(){
 		gotInstructions = false;
 		valuesDone = false;
 		countsDone = false;
+		positionDone = false;
 		valuesRetryRound = 0;
 		countsRetryRound = 0;
+		positionRetryRound = 0;
 		gridValuesPackets.clear();
 		gridCountsPackets.clear();
+		gridPositionPackets.clear();
 		return;
 	}
 
 	if(!gridConfirmed){
-		if(!valuesDone || !countsDone){
+		if(!valuesDone || !countsDone || !positionDone){
 			if(millis() - lastArqActivityMillis > REPORT_TIMEOUT_MS){
 				DBG_PRINTLN("No fragment-status report in time -- assuming it was lost, resending as a fallback.");
 				if(!valuesDone){
@@ -546,10 +591,14 @@ void loop(){
 					if(countsRetryRound < MAX_RETRY_ROUNDS){ countsRetryRound++; resendAllFragments(gridCountsPackets, "counts"); }
 					else { DBG_PRINTLN("Giving up on counts stream after max retries."); countsDone = true; }
 				}
+				if(!positionDone){
+					if(positionRetryRound < MAX_RETRY_ROUNDS){ positionRetryRound++; resendAllFragments(gridPositionPackets, "position"); }
+					else { DBG_PRINTLN("Giving up on position stream after max retries."); positionDone = true; }
+				}
 				lastArqActivityMillis = millis();
 			}
 		}
-		if(valuesDone && countsDone){
+		if(valuesDone && countsDone && positionDone){
 			DBG_PRINTLN("Grid delivery confirmed (or given up on). Waiting for instructions from base...");
 			gridConfirmed = true;
 		}
@@ -618,11 +667,20 @@ void loop(){
 	uint16_t currentGridMsgId = gridMessageIdForRound(lastSeenGridRound);
 	bool valuesComplete = reassembler.isComplete(currentGridMsgId, VALUES_STREAM_ID);
 	bool countsComplete = reassembler.isComplete(currentGridMsgId, COUNTS_STREAM_ID);
+	bool positionComplete = reassembler.isComplete(currentGridMsgId, POSITION_STREAM_ID);
 
-	if(valuesComplete && countsComplete){
-		std::vector<uint8_t> valuesBytesWithHeader, countsBytes;
+	if(valuesComplete && countsComplete && positionComplete){
+		std::vector<uint8_t> valuesBytesWithHeader, countsBytes, positionBytes;
 		reassembler.tryGetCompleteStream(currentGridMsgId, VALUES_STREAM_ID, valuesBytesWithHeader);
 		reassembler.tryGetCompleteStream(currentGridMsgId, COUNTS_STREAM_ID, countsBytes);
+		reassembler.tryGetCompleteStream(currentGridMsgId, POSITION_STREAM_ID, positionBytes);
+
+		if(positionBytes.size() != POSITION_BYTES){
+			DBG_PRINTF("Position stream is %u bytes, expected %u -- dropping this round.\n",
+			           static_cast<unsigned>(positionBytes.size()), static_cast<unsigned>(POSITION_BYTES));
+			gotGrid = true;
+			return;
+		}
 
 		// First 4 bytes of the values stream are [rows:2][cols:2] -- see the
 		// header comment on grid messages. Not a real ARQ concern (a
@@ -636,8 +694,13 @@ void loop(){
 		}
 		int gridRows = static_cast<int>(valuesBytesWithHeader[0]) | (static_cast<int>(valuesBytesWithHeader[1]) << 8);
 		int gridCols = static_cast<int>(valuesBytesWithHeader[2]) | (static_cast<int>(valuesBytesWithHeader[3]) << 8);
-		if(gridRows <= 0 || gridCols <= 0 || static_cast<size_t>(gridRows) * static_cast<size_t>(gridCols) > MAX_GRID_CELLS){
-			DBG_PRINTF("Rejected grid dimensions %dx%d from rover -- dropping this round.\n", gridRows, gridCols);
+		// Must be exactly the fixed shape, not merely a plausible one: the PC
+		// leg below is header-less, so writing a differently-shaped grid there
+		// would desync that leg permanently rather than just producing one bad
+		// round. Drop the round instead.
+		if(gridRows != GRID_ROWS || gridCols != GRID_COLS){
+			DBG_PRINTF("Rover sent a %dx%d grid but this build is fixed at %dx%d -- dropping this round "
+			           "(mismatched firmware on the two boards?).\n", gridRows, gridCols, GRID_ROWS, GRID_COLS);
 			gotGrid = true;
 			return;
 		}
@@ -662,23 +725,20 @@ void loop(){
 		           gridRows, gridCols, static_cast<unsigned>(symbols.size()), static_cast<unsigned>(runs.values.size()));
 
 		// Final explicit "you're done" status report -- without this, the
-		// rover has no unambiguous signal that both streams succeeded (it
+		// rover has no unambiguous signal that all three streams succeeded (it
 		// would just eventually time out on the last resend and give up).
-		std::vector<uint8_t> finalReport = encodeStatusReport(currentGridMsgId, STATUS_COMPLETE, {}, STATUS_COMPLETE, {});
+		std::vector<uint8_t> finalReport = encodeStatusReport(currentGridMsgId, STATUS_COMPLETE, {}, STATUS_COMPLETE, {}, STATUS_COMPLETE, {});
 		sendStream(FRAGMENT_STATUS_MESSAGE_ID, finalReport, STATUS_STREAM_ID, "final fragment status (complete)");
 		gotGrid = true;
 
-		// Forward the decompressed grid to the PC over Serial:
-		// [rows:2][cols:2][cell bytes...], little-endian -- rows/cols are
-		// whatever the rover actually sent this round, not a fixed constant.
-		// No trailing terminator -- the PC-side reader must read exactly
-		// 4 + rows*cols bytes and stop there.
-		Serial.write(static_cast<uint8_t>(gridRows & 0xFF));
-		Serial.write(static_cast<uint8_t>((gridRows >> 8) & 0xFF));
-		Serial.write(static_cast<uint8_t>(gridCols & 0xFF));
-		Serial.write(static_cast<uint8_t>((gridCols >> 8) & 0xFF));
+		// Forward the decompressed grid + rover position to the PC over Serial:
+		// [cell bytes...][x:2][y:2], little-endian, no header -- the PC-side
+		// reader must read exactly GRID_ROWS*GRID_COLS + 4 bytes and stop
+		// there. Every path that reaches here has already confirmed the shape,
+		// so this is the only place that writes to this leg.
 		Serial.write(symbols.data(), symbols.size());
-		DBG_PRINTLN("Grid forwarded to PC over Serial. Waiting for path instructions...");
+		Serial.write(positionBytes.data(), positionBytes.size());
+		DBG_PRINTLN("Grid + position forwarded to PC over Serial. Waiting for path instructions...");
 
 		// Block until the PC sends back: [waypointCount:1][x:2][y:2] repeated.
 		std::vector<uint8_t> countByte = readExactDataBytes(1);
@@ -750,8 +810,18 @@ void loop(){
 			countsStatus = countsMissing.empty() ? STATUS_NOTHING_RECEIVED : STATUS_PARTIAL;
 		}
 
+		uint8_t positionStatus;
+		std::vector<uint16_t> positionMissing;
+		if(positionComplete){
+			positionStatus = STATUS_COMPLETE;
+		} else {
+			positionMissing = reassembler.missingFragments(currentGridMsgId, POSITION_STREAM_ID);
+			positionStatus = positionMissing.empty() ? STATUS_NOTHING_RECEIVED : STATUS_PARTIAL;
+		}
+
 		DBG_PRINTLN("Quiet period elapsed with the grid still incomplete -- sending fragment-status report.");
-		std::vector<uint8_t> reportBytes = encodeStatusReport(currentGridMsgId, valuesStatus, valuesMissing, countsStatus, countsMissing);
+		std::vector<uint8_t> reportBytes = encodeStatusReport(currentGridMsgId, valuesStatus, valuesMissing,
+		                                                      countsStatus, countsMissing, positionStatus, positionMissing);
 		sendStream(FRAGMENT_STATUS_MESSAGE_ID, reportBytes, STATUS_STREAM_ID, "fragment status");
 		reportSentForThisQuietPeriod = true;
 	}
